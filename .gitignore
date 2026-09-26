@@ -4,3 +4,4 @@ __pycache__/
 tests/build/
 .DS_Store
 secrets.yaml
+dev/
