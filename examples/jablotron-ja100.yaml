@@ -1,0 +1,56 @@
+# Jablotron JA-100 alarm panel for the jablotron100 Home Assistant integration.
+# Only the HID interface is exported; the panel's mass storage interface stays
+# hidden, so the client does not read the panel's disks over the network.
+esphome:
+  name: jablotron-usbip
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+external_components:
+  - source: github://PedroPerfecto/esphome-usbip-server@main
+    components: [usbip_server]
+
+usbip_server:
+  vid: 0x16D6
+  pid: 0x0008
+  interfaces: [0]
+
+binary_sensor:
+  - platform: usbip_server
+    usb_connected:
+      name: "Alarm panel USB connected"
+    client_connected:
+      name: "USBIP client connected"
+
+text_sensor:
+  - platform: usbip_server
+    client_address:
+      name: "USBIP client"
+
+sensor:
+  - platform: usbip_server
+    import_count:
+      name: "USBIP connections"

@@ -1,0 +1,41 @@
+# Minimal USB/IP server on an ESP32-S3-DevKitC-1 with PSRAM.
+esphome:
+  name: usbip-server
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0   # keep serial logs on the USB-UART port
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none  # lower latency for interrupt transfers
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+external_components:
+  - source: github://PedroPerfecto/esphome-usbip-server@main
+    components: [usbip_server]
+
+usbip_server:
+
+binary_sensor:
+  - platform: usbip_server
+    usb_connected:
+      name: "USB device connected"
+    client_connected:
+      name: "USBIP client connected"
