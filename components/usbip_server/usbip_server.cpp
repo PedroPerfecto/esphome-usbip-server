@@ -58,6 +58,7 @@ void USBIPServer::setup() {
   // Entities may only be changed from the main loop; loop() may be disabled
   // (disable_loop), the scheduler runs regardless.
   this->set_interval("entities", 1000, [this]() { this->publish_entities_(); });
+  this->set_interval("diag", 10000, [this]() { this->publish_diag_(); });
 }
 
 void USBIPServer::publish_entities_() {
@@ -89,6 +90,53 @@ void USBIPServer::publish_entities_() {
   this->pub_client_ = addr != 0 ? 1 : 0;
   this->pub_addr_ = addr;
   this->pub_imports_ = imports;
+}
+
+void USBIPServer::publish_diag_() {
+  const uint32_t v[12] = {
+      this->in_submitted_.load(std::memory_order_relaxed),
+      this->in_done_data_.load(std::memory_order_relaxed),
+      this->in_done_empty_.load(std::memory_order_relaxed),
+      this->in_done_err_.load(std::memory_order_relaxed),
+      this->in_ret_sent_.load(std::memory_order_relaxed),
+      this->out_submitted_.load(std::memory_order_relaxed),
+      this->out_done_ok_.load(std::memory_order_relaxed),
+      this->unlink_rx_.load(std::memory_order_relaxed),
+      this->dropped_silent_.load(std::memory_order_relaxed),
+      this->stale_skip_.load(std::memory_order_relaxed),
+      this->send_errors_.load(std::memory_order_relaxed),
+      this->slot_exhausted_.load(std::memory_order_relaxed),
+  };
+  static const char *const kNames[12] = {
+      "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
+      "out_done_ok",  "unlink_rx",    "dropped_silent", "stale_skip", "send_errors",    "slot_exhausted",
+  };
+  bool any_changed = false;
+  for (int i = 0; i < 12; ++i) {
+    if (v[i] != this->diag_pub_[i]) any_changed = true;
+  }
+  if (!any_changed) return;
+
+  char line[320];
+  int off = 0;
+  for (int i = 0; i < 12 && off < static_cast<int>(sizeof(line)); ++i) {
+    off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
+  }
+  ESP_LOGI(TAG, "diag: %s", line);
+
+#ifdef USE_SENSOR
+  sensor::Sensor *const sensors[12] = {
+      this->in_submitted_sensor_, this->in_done_data_sensor_,  this->in_done_empty_sensor_,
+      this->in_done_err_sensor_,  this->in_ret_sent_sensor_,   this->out_submitted_sensor_,
+      this->out_done_ok_sensor_,  this->unlink_rx_sensor_,     this->dropped_silent_sensor_,
+      this->stale_skip_sensor_,   this->send_errors_sensor_,   this->slot_exhausted_sensor_,
+  };
+  for (int i = 0; i < 12; ++i) {
+    if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
+  }
+#endif
+
+  for (int i = 0; i < 12; ++i) this->diag_pub_[i] = v[i];
 }
 
 void USBIPServer::note_import_(int sock) {
@@ -692,6 +740,7 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
 
   PendingSlot *slot = this->alloc_slot_();
   if (slot == nullptr) {
+    this->slot_exhausted_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGW(TAG, "seq %u: too many pending transfers (max_pending %u) -> -EPIPE", (unsigned) seq, this->max_pending_);
     return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
   }
@@ -759,6 +808,11 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
     this->free_slot_(*slot);
     ESP_LOGW(TAG, "seq %u: ep %02X submit failed: %s -> -EPIPE", (unsigned) seq, addr, esp_err_to_name(err));
     return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+  if (dir_in) {
+    this->in_submitted_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    this->out_submitted_.fetch_add(1, std::memory_order_relaxed);
   }
   return true;
 }
@@ -869,6 +923,12 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
 }
 
 bool USBIPServer::handle_unlink_(int sock, const usbip::Message &m) {
+  // Counts every CMD_UNLINK received, regardless of whether the target turns out to be a
+  // control (ep0) or data-endpoint transfer -- UNLINK itself isn't tied to one endpoint type
+  // until the target slot is found below, so this one counter is not restricted to data
+  // endpoints like the others. Flagging this choice per the task's "len pre data endpointy"
+  // framing, which does not unambiguously cover this counter.
+  this->unlink_rx_.fetch_add(1, std::memory_order_relaxed);
   const uint32_t target = m.unlink.unlink_seqnum;
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     PendingSlot &s = this->slots_[i];
@@ -897,7 +957,15 @@ bool USBIPServer::drain_completions_(int sock) {
   while (xQueueReceive(this->done_queue_, &idx, 0) == pdTRUE) {
     PendingSlot &s = this->slots_[idx];
     usb_transfer_t *x = s.xfer;
-    if (!s.used || x == nullptr) continue;
+    if (!s.used || x == nullptr) {
+      // Stale/duplicate done_queue_ entry for an already-freed (or reused) slot -- in practice this
+      // can only arise from the chunked-bulk resubmit race (same slot's xfer completes again before
+      // the previous completion for it is drained), and chunking never applies to ep0 or interrupt,
+      // so this is implicitly a data-endpoint event; not gated on s.is_control because s may already
+      // have been reset/reused and its fields are no longer meaningful for the original transfer.
+      this->stale_skip_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
 
     // Transfer cancelled only because of an UNLINK of another transfer on the same endpoint: resubmit.
     if (x->status == USB_TRANSFER_STATUS_CANCELED && !s.is_control && !s.unlink_pending && !s.orphan) {
@@ -909,6 +977,7 @@ bool USBIPServer::drain_completions_(int sock) {
       ESP_LOGW(TAG, "seq %u: resubmit on ep %02X failed -> -EPIPE", (unsigned) s.seqnum, s.ep_addr);
       if (ok && sock >= 0) {
         ok = send_ret_submit_(sock, s.seqnum, s.start_frame, s.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+        if (!ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
       }
       this->free_slot_(s);
       continue;
@@ -928,6 +997,28 @@ bool USBIPServer::drain_completions_(int sock) {
         ESP_LOGW(TAG, "seq %u: next chunk on ep %02X failed -> -EPIPE after %u B", (unsigned) s.seqnum, s.ep_addr,
                  (unsigned) s.plan.done());
         chunk_submit_failed = true;
+      }
+    }
+
+    // Classify the raw USB completion itself, before deciding whether/how to notify the client
+    // (data endpoints only, not ep0; the collateral-cancel-resubmit branch above already handled
+    // its own completions via `continue` and never reaches here). For a chunked transfer this
+    // reflects the *last* chunk's x->actual_num_bytes, not the total bytes moved so far
+    // (s.plan.done()) -- counting the HW completion event as specified, not the client-visible
+    // aggregate result.
+    if (!s.is_control) {
+      if (s.dir_in) {
+        if (x->status == USB_TRANSFER_STATUS_COMPLETED) {
+          if (x->actual_num_bytes > 0) {
+            this->in_done_data_.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            this->in_done_empty_.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else {
+          this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
+        }
+      } else if (x->status == USB_TRANSFER_STATUS_COMPLETED) {
+        this->out_done_ok_.fetch_add(1, std::memory_order_relaxed);
       }
     }
 
@@ -963,8 +1054,20 @@ bool USBIPServer::drain_completions_(int sock) {
           }
         }
         ok = send_ret_submit_(sock, s.seqnum, s.start_frame, s.number_of_packets, status, len, data);
+        // "RET_SUBMIT s dátami pre IN úspešne odoslaný": interpreted as len > 0, i.e. the reply
+        // actually carried an IN data payload, not merely "any successful IN RET_SUBMIT".
+        if (!s.is_control && ok && s.dir_in && len > 0) this->in_ret_sent_.fetch_add(1, std::memory_order_relaxed);
       }
+      // Covers both the RET_UNLINK and RET_SUBMIT sends above: any send_all_ failure on a
+      // data-endpoint slot, regardless of whether it carried data.
+      if (!s.is_control && !ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
       ESP_LOGV(TAG, "seq %u: done, status %d, %u B", (unsigned) s.seqnum, (int) status, (unsigned) len);
+    } else if (!s.is_control && len > 0) {
+      // ok==false (an earlier send in this same drain batch already failed), or s.orphan (session
+      // ended), or sock<0 (end_session_ drain): no RET_SUBMIT/RET_UNLINK is even attempted, so a
+      // completed transfer that carried data is silently dropped here. Only counted when there
+      // was data to lose (len > 0); a zero-length completion dropped the same way is not a loss.
+      this->dropped_silent_.fetch_add(1, std::memory_order_relaxed);
     }
     this->free_slot_(s);
   }

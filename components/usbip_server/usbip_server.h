@@ -48,6 +48,19 @@ class USBIPServer : public usb_host::USBClient {
 #endif
 #ifdef USE_SENSOR
   SUB_SENSOR(import_count)
+  // Diagnostic counters (data endpoints only, not ep0). See usbip_server.cpp for exact count points.
+  SUB_SENSOR(in_submitted)
+  SUB_SENSOR(in_done_data)
+  SUB_SENSOR(in_done_empty)
+  SUB_SENSOR(in_done_err)
+  SUB_SENSOR(in_ret_sent)
+  SUB_SENSOR(out_submitted)
+  SUB_SENSOR(out_done_ok)
+  SUB_SENSOR(unlink_rx)
+  SUB_SENSOR(dropped_silent)
+  SUB_SENSOR(stale_skip)
+  SUB_SENSOR(send_errors)
+  SUB_SENSOR(slot_exhausted)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -118,6 +131,7 @@ class USBIPServer : public usb_host::USBClient {
   bool device_ready_();
   void note_import_(int sock);   // TCP task: successful import (client + counter)
   void publish_entities_();      // main loop: state to entities, only on change
+  void publish_diag_();          // main loop: diag counters to log/entities, only on change
   void release_interfaces_();
 
   uint16_t port_{3240};
@@ -152,11 +166,31 @@ class USBIPServer : public usb_host::USBClient {
   // Entity state: written by the TCP task, read by the main loop (publish_entities_).
   std::atomic<uint32_t> client_addr_{0};   // s_addr of the client with an import, 0 = none
   std::atomic<uint32_t> import_count_{0};  // successful imports since boot
+
+  // Diagnostic counters, data endpoints only (not ep0/control). Written from the TCP task
+  // (and, for in_done_*/stale_skip, conceptually "observed by" the TCP task draining the USB
+  // task's completion queue); read from the main loop by publish_diag_(). fetch_add with
+  // memory_order_relaxed: only the counts matter, not ordering between counters.
+  std::atomic<uint32_t> in_submitted_{0};    // handle_data_submit_: IN submit_locked_ succeeded
+  std::atomic<uint32_t> in_done_data_{0};    // drain_completions_: IN, status COMPLETED, actual_num_bytes > 0
+  std::atomic<uint32_t> in_done_empty_{0};   // drain_completions_: IN, status COMPLETED, actual_num_bytes == 0
+  std::atomic<uint32_t> in_done_err_{0};     // drain_completions_: IN, status != COMPLETED (incl. CANCELED)
+  std::atomic<uint32_t> in_ret_sent_{0};     // drain_completions_: RET_SUBMIT with IN data sent ok (len > 0)
+  std::atomic<uint32_t> out_submitted_{0};   // handle_data_submit_: OUT submit_locked_ succeeded
+  std::atomic<uint32_t> out_done_ok_{0};     // drain_completions_: OUT, status COMPLETED
+  std::atomic<uint32_t> unlink_rx_{0};       // handle_unlink_: CMD_UNLINK received
+  std::atomic<uint32_t> dropped_silent_{0};  // drain_completions_: data (len>0) not sent (ok==false/orphan/sock<0)
+  std::atomic<uint32_t> stale_skip_{0};      // drain_completions_: stale queue entry (!s.used || x == nullptr)
+  std::atomic<uint32_t> send_errors_{0};     // drain_completions_: send_ret_submit_/send_all_ failed (data ep)
+  std::atomic<uint32_t> slot_exhausted_{0};  // handle_data_submit_: alloc_slot_() == nullptr
+
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
   int8_t pub_client_{-1};
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
+  // Last published diag counters (main loop only), same order as in publish_diag_().
+  uint32_t diag_pub_[12]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
 
