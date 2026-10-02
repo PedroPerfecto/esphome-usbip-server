@@ -93,7 +93,7 @@ void USBIPServer::publish_entities_() {
 }
 
 void USBIPServer::publish_diag_() {
-  const uint32_t v[14] = {
+  const uint32_t v[16] = {
       this->in_submitted_.load(std::memory_order_relaxed),
       this->in_done_data_.load(std::memory_order_relaxed),
       this->in_done_empty_.load(std::memory_order_relaxed),
@@ -108,39 +108,42 @@ void USBIPServer::publish_diag_() {
       this->slot_exhausted_.load(std::memory_order_relaxed),
       this->unlink_discarded_.load(std::memory_order_relaxed),
       this->in_resubmitted_.load(std::memory_order_relaxed),
+      this->in_send_failed_.load(std::memory_order_relaxed),
+      this->cb_queue_full_.load(std::memory_order_relaxed),
   };
-  static const char *const kNames[14] = {
+  static const char *const kNames[16] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
       "out_done_ok",  "unlink_rx",    "dropped_silent", "stale_skip", "send_errors",    "slot_exhausted",
-      "unlink_discarded", "in_resubmitted",
+      "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
   };
   bool any_changed = false;
-  for (int i = 0; i < 14; ++i) {
+  for (int i = 0; i < 16; ++i) {
     if (v[i] != this->diag_pub_[i]) any_changed = true;
   }
   if (!any_changed) return;
 
-  char line[400];
+  char line[480];
   int off = 0;
-  for (int i = 0; i < 14 && off < static_cast<int>(sizeof(line)); ++i) {
+  for (int i = 0; i < 16 && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
   }
   ESP_LOGI(TAG, "diag: %s", line);
 
 #ifdef USE_SENSOR
-  sensor::Sensor *const sensors[14] = {
+  sensor::Sensor *const sensors[16] = {
       this->in_submitted_sensor_, this->in_done_data_sensor_,  this->in_done_empty_sensor_,
       this->in_done_err_sensor_,  this->in_ret_sent_sensor_,   this->out_submitted_sensor_,
       this->out_done_ok_sensor_,  this->unlink_rx_sensor_,     this->dropped_silent_sensor_,
       this->stale_skip_sensor_,   this->send_errors_sensor_,   this->slot_exhausted_sensor_,
-      this->unlink_discarded_sensor_, this->in_resubmitted_sensor_,
+      this->unlink_discarded_sensor_, this->in_resubmitted_sensor_, this->in_send_failed_sensor_,
+      this->cb_queue_full_sensor_,
   };
-  for (int i = 0; i < 14; ++i) {
+  for (int i = 0; i < 16; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
   }
 #endif
 
-  for (int i = 0; i < 14; ++i) this->diag_pub_[i] = v[i];
+  for (int i = 0; i < 16; ++i) this->diag_pub_[i] = v[i];
 }
 
 void USBIPServer::note_import_(int sock) {
@@ -332,7 +335,10 @@ bool USBIPServer::device_ready_() {
 
 void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   auto *slot = static_cast<PendingSlot *>(xfer->context);
-  xQueueSend(slot->owner->done_queue_, &slot->index, 0);  // the queue has room for every slot
+  // The queue has room for every slot. Runs in usb_task (a FreeRTOS task, not an ISR).
+  if (xQueueSend(slot->owner->done_queue_, &slot->index, 0) != pdTRUE) {
+    slot->owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 // ---------------------------------------------------------------- TCP task
@@ -1007,6 +1013,12 @@ bool USBIPServer::drain_completions_(int sock) {
       }
     }
 
+    // IN data endpoint, status COMPLETED, device delivered > 0 bytes (raw x->actual_num_bytes).
+    // Same predicate as in_done_data, reused so that every data-bearing IN completion lands in
+    // exactly one of in_ret_sent / in_send_failed / dropped_silent / unlink_discarded.
+    const bool in_data_done =
+        !s.is_control && s.dir_in && x->status == USB_TRANSFER_STATUS_COMPLETED && x->actual_num_bytes > 0;
+
     // Classify the raw USB completion itself, before deciding whether/how to notify the client
     // (data endpoints only, not ep0; the collateral-cancel-resubmit branch above already handled
     // its own completions via `continue` and never reaches here). For a chunked transfer this
@@ -1051,8 +1063,7 @@ bool USBIPServer::drain_completions_(int sock) {
     if (ok && !s.orphan && sock >= 0) {
       if (s.unlink_pending) {
         // Only RET_UNLINK goes out (no payload), so data the device already delivered is discarded.
-        if (!s.is_control && s.dir_in && x->status == USB_TRANSFER_STATUS_COMPLETED && x->actual_num_bytes > 0)
-          this->unlink_discarded_.fetch_add(1, std::memory_order_relaxed);
+        if (in_data_done) this->unlink_discarded_.fetch_add(1, std::memory_order_relaxed);
         ok = send_ret_unlink_(sock, s.unlink_seqnum, usbip::kLinuxECONNRESET);
       } else {
         const uint8_t *data = nullptr;
@@ -1064,19 +1075,23 @@ bool USBIPServer::drain_completions_(int sock) {
           }
         }
         ok = send_ret_submit_(sock, s.seqnum, s.start_frame, s.number_of_packets, status, len, data);
-        // "RET_SUBMIT s dátami pre IN úspešne odoslaný": interpreted as len > 0, i.e. the reply
-        // actually carried an IN data payload, not merely "any successful IN RET_SUBMIT".
-        if (!s.is_control && ok && s.dir_in && len > 0) this->in_ret_sent_.fetch_add(1, std::memory_order_relaxed);
+        if (in_data_done) {
+          if (ok) {
+            this->in_ret_sent_.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            this->in_send_failed_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
       }
       // Covers both the RET_UNLINK and RET_SUBMIT sends above: any send_all_ failure on a
       // data-endpoint slot, regardless of whether it carried data.
       if (!s.is_control && !ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
       ESP_LOGV(TAG, "seq %u: done, status %d, %u B", (unsigned) s.seqnum, (int) status, (unsigned) len);
-    } else if (!s.is_control && len > 0) {
+    } else if (in_data_done) {
       // ok==false (an earlier send in this same drain batch already failed), or s.orphan (session
       // ended), or sock<0 (end_session_ drain): no RET_SUBMIT/RET_UNLINK is even attempted, so a
-      // completed transfer that carried data is silently dropped here. Only counted when there
-      // was data to lose (len > 0); a zero-length completion dropped the same way is not a loss.
+      // COMPLETED IN transfer that carried data is silently dropped here. Other drops (OUT, errors,
+      // zero-length) are intentionally not counted.
       this->dropped_silent_.fetch_add(1, std::memory_order_relaxed);
     }
     this->free_slot_(s);

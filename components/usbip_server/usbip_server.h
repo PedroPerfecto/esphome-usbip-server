@@ -63,6 +63,8 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(slot_exhausted)
   SUB_SENSOR(unlink_discarded)
   SUB_SENSOR(in_resubmitted)
+  SUB_SENSOR(in_send_failed)
+  SUB_SENSOR(cb_queue_full)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -177,16 +179,18 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> in_done_data_{0};    // drain_completions_: IN, status COMPLETED, actual_num_bytes > 0
   std::atomic<uint32_t> in_done_empty_{0};   // drain_completions_: IN, status COMPLETED, actual_num_bytes == 0
   std::atomic<uint32_t> in_done_err_{0};     // drain_completions_: IN, status != COMPLETED (incl. CANCELED)
-  std::atomic<uint32_t> in_ret_sent_{0};     // drain_completions_: RET_SUBMIT with IN data sent ok (len > 0)
+  std::atomic<uint32_t> in_ret_sent_{0};     // drain_completions_: IN COMPLETED with data, RET_SUBMIT sent ok
   std::atomic<uint32_t> out_submitted_{0};   // handle_data_submit_: OUT submit_locked_ succeeded
   std::atomic<uint32_t> out_done_ok_{0};     // drain_completions_: OUT, status COMPLETED
   std::atomic<uint32_t> unlink_rx_{0};       // handle_unlink_: CMD_UNLINK received
-  std::atomic<uint32_t> dropped_silent_{0};  // drain_completions_: data (len>0) not sent (ok==false/orphan/sock<0)
+  std::atomic<uint32_t> dropped_silent_{0};  // drain_completions_: IN COMPLETED data not sent (ok==false/orphan/sock<0)
   std::atomic<uint32_t> stale_skip_{0};      // drain_completions_: stale queue entry (!s.used || x == nullptr)
   std::atomic<uint32_t> send_errors_{0};     // drain_completions_: send_ret_submit_/send_all_ failed (data ep)
   std::atomic<uint32_t> slot_exhausted_{0};  // handle_data_submit_: alloc_slot_() == nullptr
   std::atomic<uint32_t> unlink_discarded_{0};  // drain_completions_: IN COMPLETED with data, but only RET_UNLINK sent
   std::atomic<uint32_t> in_resubmitted_{0};    // drain_completions_: IN collateral cancel, resubmit succeeded
+  std::atomic<uint32_t> in_send_failed_{0};    // drain_completions_: RET_SUBMIT send failed for IN COMPLETED data
+  std::atomic<uint32_t> cb_queue_full_{0};     // transfer_cb_ (USB task): xQueueSend to done_queue_ failed
 
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
@@ -194,7 +198,7 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag counters (main loop only), same order as in publish_diag_().
-  uint32_t diag_pub_[14]{};
+  uint32_t diag_pub_[16]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
 

@@ -26,6 +26,8 @@ CONF_SEND_ERRORS = "send_errors"
 CONF_SLOT_EXHAUSTED = "slot_exhausted"
 CONF_UNLINK_DISCARDED = "unlink_discarded"
 CONF_IN_RESUBMITTED = "in_resubmitted"
+CONF_IN_SEND_FAILED = "in_send_failed"
+CONF_CB_QUEUE_FULL = "cb_queue_full"
 
 _DIAG_COUNTERS = (
     CONF_IN_SUBMITTED,
@@ -42,6 +44,8 @@ _DIAG_COUNTERS = (
     CONF_SLOT_EXHAUSTED,
     CONF_UNLINK_DISCARDED,
     CONF_IN_RESUBMITTED,
+    CONF_IN_SEND_FAILED,
+    CONF_CB_QUEUE_FULL,
 )
 
 CONFIG_SCHEMA = cv.Schema(
