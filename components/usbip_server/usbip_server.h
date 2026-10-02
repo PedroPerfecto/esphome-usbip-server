@@ -61,6 +61,8 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(stale_skip)
   SUB_SENSOR(send_errors)
   SUB_SENSOR(slot_exhausted)
+  SUB_SENSOR(unlink_discarded)
+  SUB_SENSOR(in_resubmitted)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -183,6 +185,8 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> stale_skip_{0};      // drain_completions_: stale queue entry (!s.used || x == nullptr)
   std::atomic<uint32_t> send_errors_{0};     // drain_completions_: send_ret_submit_/send_all_ failed (data ep)
   std::atomic<uint32_t> slot_exhausted_{0};  // handle_data_submit_: alloc_slot_() == nullptr
+  std::atomic<uint32_t> unlink_discarded_{0};  // drain_completions_: IN COMPLETED with data, but only RET_UNLINK sent
+  std::atomic<uint32_t> in_resubmitted_{0};    // drain_completions_: IN collateral cancel, resubmit succeeded
 
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
@@ -190,7 +194,7 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag counters (main loop only), same order as in publish_diag_().
-  uint32_t diag_pub_[12]{};
+  uint32_t diag_pub_[14]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
 

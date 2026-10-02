@@ -93,7 +93,7 @@ void USBIPServer::publish_entities_() {
 }
 
 void USBIPServer::publish_diag_() {
-  const uint32_t v[12] = {
+  const uint32_t v[14] = {
       this->in_submitted_.load(std::memory_order_relaxed),
       this->in_done_data_.load(std::memory_order_relaxed),
       this->in_done_empty_.load(std::memory_order_relaxed),
@@ -106,37 +106,41 @@ void USBIPServer::publish_diag_() {
       this->stale_skip_.load(std::memory_order_relaxed),
       this->send_errors_.load(std::memory_order_relaxed),
       this->slot_exhausted_.load(std::memory_order_relaxed),
+      this->unlink_discarded_.load(std::memory_order_relaxed),
+      this->in_resubmitted_.load(std::memory_order_relaxed),
   };
-  static const char *const kNames[12] = {
+  static const char *const kNames[14] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
       "out_done_ok",  "unlink_rx",    "dropped_silent", "stale_skip", "send_errors",    "slot_exhausted",
+      "unlink_discarded", "in_resubmitted",
   };
   bool any_changed = false;
-  for (int i = 0; i < 12; ++i) {
+  for (int i = 0; i < 14; ++i) {
     if (v[i] != this->diag_pub_[i]) any_changed = true;
   }
   if (!any_changed) return;
 
-  char line[320];
+  char line[400];
   int off = 0;
-  for (int i = 0; i < 12 && off < static_cast<int>(sizeof(line)); ++i) {
+  for (int i = 0; i < 14 && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
   }
   ESP_LOGI(TAG, "diag: %s", line);
 
 #ifdef USE_SENSOR
-  sensor::Sensor *const sensors[12] = {
+  sensor::Sensor *const sensors[14] = {
       this->in_submitted_sensor_, this->in_done_data_sensor_,  this->in_done_empty_sensor_,
       this->in_done_err_sensor_,  this->in_ret_sent_sensor_,   this->out_submitted_sensor_,
       this->out_done_ok_sensor_,  this->unlink_rx_sensor_,     this->dropped_silent_sensor_,
       this->stale_skip_sensor_,   this->send_errors_sensor_,   this->slot_exhausted_sensor_,
+      this->unlink_discarded_sensor_, this->in_resubmitted_sensor_,
   };
-  for (int i = 0; i < 12; ++i) {
+  for (int i = 0; i < 14; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
   }
 #endif
 
-  for (int i = 0; i < 12; ++i) this->diag_pub_[i] = v[i];
+  for (int i = 0; i < 14; ++i) this->diag_pub_[i] = v[i];
 }
 
 void USBIPServer::note_import_(int sock) {
@@ -958,19 +962,22 @@ bool USBIPServer::drain_completions_(int sock) {
     PendingSlot &s = this->slots_[idx];
     usb_transfer_t *x = s.xfer;
     if (!s.used || x == nullptr) {
-      // Stale/duplicate done_queue_ entry for an already-freed (or reused) slot -- in practice this
-      // can only arise from the chunked-bulk resubmit race (same slot's xfer completes again before
-      // the previous completion for it is drained), and chunking never applies to ep0 or interrupt,
-      // so this is implicitly a data-endpoint event; not gated on s.is_control because s may already
-      // have been reset/reused and its fields are no longer meaningful for the original transfer.
+      // done_queue_ entry for a slot that is already free or has no xfer. The mechanism that would
+      // produce this is not established (the next chunk is only submitted after the previous entry
+      // is drained, so duplicates are not obvious); it is counted as a defensive guard. Not gated
+      // on s.is_control because s may already have been reset/reused, so its fields are meaningless.
       this->stale_skip_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
 
     // Transfer cancelled only because of an UNLINK of another transfer on the same endpoint: resubmit.
     if (x->status == USB_TRANSFER_STATUS_CANCELED && !s.is_control && !s.unlink_pending && !s.orphan) {
+      // The cancelled completion is an IN completion with status != COMPLETED: counted here as
+      // in_done_err because this branch `continue`s before the classification block below.
+      if (s.dir_in) this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
       x->status = USB_TRANSFER_STATUS_COMPLETED;
       if (this->submit_locked_(x, false) == ESP_OK) {
+        if (s.dir_in) this->in_resubmitted_.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGV(TAG, "seq %u: collateral cancel on ep %02X -> resubmitted", (unsigned) s.seqnum, s.ep_addr);
         continue;
       }
@@ -1043,6 +1050,9 @@ bool USBIPServer::drain_completions_(int sock) {
 
     if (ok && !s.orphan && sock >= 0) {
       if (s.unlink_pending) {
+        // Only RET_UNLINK goes out (no payload), so data the device already delivered is discarded.
+        if (!s.is_control && s.dir_in && x->status == USB_TRANSFER_STATUS_COMPLETED && x->actual_num_bytes > 0)
+          this->unlink_discarded_.fetch_add(1, std::memory_order_relaxed);
         ok = send_ret_unlink_(sock, s.unlink_seqnum, usbip::kLinuxECONNRESET);
       } else {
         const uint8_t *data = nullptr;

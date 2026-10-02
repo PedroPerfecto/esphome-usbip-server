@@ -24,6 +24,8 @@ CONF_DROPPED_SILENT = "dropped_silent"
 CONF_STALE_SKIP = "stale_skip"
 CONF_SEND_ERRORS = "send_errors"
 CONF_SLOT_EXHAUSTED = "slot_exhausted"
+CONF_UNLINK_DISCARDED = "unlink_discarded"
+CONF_IN_RESUBMITTED = "in_resubmitted"
 
 _DIAG_COUNTERS = (
     CONF_IN_SUBMITTED,
@@ -38,6 +40,8 @@ _DIAG_COUNTERS = (
     CONF_STALE_SKIP,
     CONF_SEND_ERRORS,
     CONF_SLOT_EXHAUSTED,
+    CONF_UNLINK_DISCARDED,
+    CONF_IN_RESUBMITTED,
 )
 
 CONFIG_SCHEMA = cv.Schema(
