@@ -47,6 +47,8 @@ class USBIPServer : public usb_host::USBClient {
 #endif
 #ifdef USE_TEXT_SENSOR
   SUB_TEXT_SENSOR(client_address)
+  // Record of a long dev_lock_ wait / watchdog reboot in the previous boot (RTC_NOINIT), "none" if absent.
+  SUB_TEXT_SENSOR(lock_diag)
 #endif
 #ifdef USE_SENSOR
   SUB_SENSOR(import_count)
@@ -142,6 +144,12 @@ class USBIPServer : public usb_host::USBClient {
   void publish_entities_();      // main loop: state to entities, only on change
   void publish_diag_();          // main loop: diag counters to log/entities, only on change
   void check_lock_watchdog_();   // main loop: reboot if dev_lock_ stays held in a usb_host_* section
+  // Main loop only. Store a record of a long dev_lock_ wait in RTC_NOINIT memory (survives the
+  // reboot that follows), see usbip_server.cpp.
+  void record_lock_event_(uint8_t kind);
+  // Main loop only: dev_lock_ Take that leaves a record after LOOP_LOCK_WARN_MS, then waits as before.
+  void take_dev_lock_from_loop_(uint8_t kind);
+  void load_lock_diag_();  // setup(): report and clear the record left by the previous boot
   void release_interfaces_();
 
   uint16_t port_{3240};

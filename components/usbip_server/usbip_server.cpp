@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <lwip/sockets.h>
 
@@ -21,6 +22,8 @@ static constexpr UBaseType_t TCP_TASK_PRIORITY = 4;  // below the USB task (5), 
 static constexpr uint32_t SELECT_TIMEOUT_US = 2000;
 static constexpr uint32_t SESSION_DRAIN_TIMEOUT_MS = 2000;
 static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
+// on_connected/on_disconnected (main loop) leave a record if dev_lock_ is not free after this long.
+static constexpr uint32_t LOOP_LOCK_WARN_MS = 2000;
 // A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
 
@@ -43,9 +46,63 @@ static const char *parse_error_str(usbip::ParseError e) {
   }
 }
 
+// ---------------------------------------------------------------- lock diag record
+
+// Survives software resets and panic reboots (RTC slow memory, not cleared by IDF startup), but not
+// power loss: after a power cycle the content is garbage, hence the magic + range checks. It is a
+// different section/memory than the ESPHome crash handler's .noinit data (esp32/crash_handler.cpp).
+// Only the main loop writes it; setup() of the next boot reads and clears it.
+namespace {
+constexpr uint32_t LOCK_DIAG_MAGIC = 0x4C4B4447;  // "LKDG"
+enum LockDiagKind : uint8_t {
+  KIND_NONE = 0,
+  KIND_WATCHDOG_REBOOT = 1,
+  KIND_CONNECT_WAIT = 2,
+  KIND_DISCONNECT_WAIT = 3,
+};
+struct LockDiagRecord {
+  uint32_t magic;
+  uint8_t kind;
+  uint8_t site;  // USBIPServer::LockSite, 0 = no tracked section holding the lock
+  uint16_t reserved;
+  uint32_t held_ms;
+  uint32_t uptime_ms;
+};
+static_assert(sizeof(LockDiagRecord) == 16, "unexpected LockDiagRecord layout");
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+RTC_NOINIT_ATTR LockDiagRecord s_lock_diag;
+
+// Fields first, the magic last (with a fence), so a reset in the middle leaves no half-written
+// record that looks valid.
+void store_lock_diag(uint8_t kind, uint8_t site, uint32_t held_ms) {
+  s_lock_diag.magic = 0;
+  s_lock_diag.kind = kind;
+  s_lock_diag.site = site;
+  s_lock_diag.reserved = 0;
+  s_lock_diag.held_ms = held_ms;
+  s_lock_diag.uptime_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+  std::atomic_thread_fence(std::memory_order_release);
+  s_lock_diag.magic = LOCK_DIAG_MAGIC;
+}
+
+const char *lock_diag_kind_str(uint8_t kind) {
+  switch (kind) {
+    case KIND_WATCHDOG_REBOOT:
+      return "WATCHDOG_REBOOT";
+    case KIND_CONNECT_WAIT:
+      return "CONNECT_WAIT";
+    case KIND_DISCONNECT_WAIT:
+      return "DISCONNECT_WAIT";
+    default:
+      return "unknown";
+  }
+}
+}  // namespace
+
 // ---------------------------------------------------------------- ESPHome
 
 void USBIPServer::setup() {
+  this->load_lock_diag_();
   if (this->max_pending_ > MAX_PENDING_LIMIT) this->max_pending_ = MAX_PENDING_LIMIT;
   this->dev_lock_ = xSemaphoreCreateMutex();
   this->done_queue_ = xQueueCreate(this->max_pending_, sizeof(uint8_t));
@@ -67,8 +124,44 @@ void USBIPServer::setup() {
   this->set_interval("diag", 10000, [this]() { this->publish_diag_(); });
 }
 
+void USBIPServer::load_lock_diag_() {
+  char text[96] = "žiadny";
+  const LockDiagRecord rec = s_lock_diag;
+  if (rec.magic == LOCK_DIAG_MAGIC && rec.kind >= KIND_WATCHDOG_REBOOT && rec.kind <= KIND_DISCONNECT_WAIT &&
+      rec.site <= static_cast<uint8_t>(LockSite::CLEAR)) {
+    snprintf(text, sizeof(text), "%s site=%s held=%u ms uptime=%u ms", lock_diag_kind_str(rec.kind),
+             lock_site_str_(rec.site), (unsigned) rec.held_ms, (unsigned) rec.uptime_ms);
+    ESP_LOGE(TAG, "Previous boot left a dev_lock_ record: %s", text);
+  }
+  s_lock_diag.magic = 0;
+#ifdef USE_TEXT_SENSOR
+  if (this->lock_diag_text_sensor_ != nullptr) this->lock_diag_text_sensor_->publish_state(text);
+#endif
+}
+
+void USBIPServer::record_lock_event_(uint8_t kind) {
+  const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
+  uint8_t site = 0;
+  uint32_t held_ms = 0;
+  if (since != 0) {  // 0 = the lock is held by a section that is not tracked (or a stale site)
+    site = this->lock_site_.load(std::memory_order_relaxed);
+    held_ms = (lock_clock_us_() - since) / 1000;
+  }
+  store_lock_diag(kind, site, held_ms);
+  ESP_LOGE(TAG, "dev_lock_ busy: %s site=%s held=%u ms", lock_diag_kind_str(kind), lock_site_str_(site),
+           (unsigned) held_ms);
+}
+
+void USBIPServer::take_dev_lock_from_loop_(uint8_t kind) {
+  if (xSemaphoreTake(this->dev_lock_, pdMS_TO_TICKS(LOOP_LOCK_WARN_MS)) == pdTRUE) return;
+  this->record_lock_event_(kind);
+  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+}
+
 const char *USBIPServer::lock_site_str_(uint8_t site) {
   switch (static_cast<LockSite>(site)) {
+    case LockSite::NONE:
+      return "none";
     case LockSite::SUBMIT:
       return "submit_locked_";
     case LockSite::CANCEL:
@@ -86,7 +179,7 @@ const char *USBIPServer::lock_site_str_(uint8_t site) {
 void USBIPServer::check_lock_watchdog_() {
   const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
   if (since == 0) return;
-  const uint32_t held_us = lock_clock_us_() - since;
+  const uint32_t held_us = lock_clock_us_() - since;  // modulo 2^32: correct across a 32-bit wrap
   if (held_us <= LOCK_WATCHDOG_US) return;
   // Re-check: the section may have finished (and a new one started) between the two reads.
   if (this->lock_since_us_.load(std::memory_order_relaxed) != since) return;
@@ -94,6 +187,8 @@ void USBIPServer::check_lock_watchdog_() {
   ++this->lock_watchdog_reboots_;
   ESP_LOGE(TAG, "dev_lock_ held %u ms in %s (watchdog reboot #%u), rebooting", (unsigned) (held_us / 1000),
            lock_site_str_(site), (unsigned) this->lock_watchdog_reboots_);
+  // Written last: safe_reboot() is the point of no return, the record is what the next boot reports.
+  store_lock_diag(KIND_WATCHDOG_REBOOT, site, held_us / 1000);
   App.safe_reboot();
 }
 
@@ -311,7 +406,7 @@ void USBIPServer::on_connected() {
   if (filtered_len > 0)
     ESP_LOGI(TAG, "Interface filter: exporting %u of %u interfaces", d.bNumInterfaces, cfg_desc->bNumInterfaces);
 
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+  this->take_dev_lock_from_loop_(KIND_CONNECT_WAIT);
   if (filtered_len > 0) memcpy(this->cfg_filtered_, filtered, filtered_len);
   this->cfg_filtered_len_ = static_cast<uint16_t>(filtered_len);
   this->dev_info_ = d;
@@ -344,7 +439,7 @@ void USBIPServer::release_interfaces_() {
 
 void USBIPServer::on_disconnected() {
   // Stop new transfers first (the TCP task submits under the same lock).
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+  this->take_dev_lock_from_loop_(KIND_DISCONNECT_WAIT);
   this->dev_ready_ = false;
   this->dev_ready_pub_.store(false, std::memory_order_relaxed);
   xSemaphoreGive(this->dev_lock_);
