@@ -23,7 +23,7 @@ static constexpr uint32_t SELECT_TIMEOUT_US = 2000;
 static constexpr uint32_t SESSION_DRAIN_TIMEOUT_MS = 2000;
 static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 // on_connected/on_disconnected (main loop) leave a record if dev_lock_ is not free after this long.
-static constexpr uint32_t LOOP_LOCK_WARN_MS = 2000;
+static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
 // A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
 
