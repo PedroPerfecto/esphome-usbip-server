@@ -1,7 +1,11 @@
 import esphome.codegen as cg
 from esphome.components import sensor
 import esphome.config_validation as cv
-from esphome.const import ENTITY_CATEGORY_DIAGNOSTIC, STATE_CLASS_TOTAL_INCREASING
+from esphome.const import (
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    STATE_CLASS_MEASUREMENT,
+    STATE_CLASS_TOTAL_INCREASING,
+)
 
 from . import CONF_USBIP_SERVER_ID, USBIPServer
 
@@ -48,6 +52,11 @@ _DIAG_COUNTERS = (
     CONF_CB_QUEUE_FULL,
 )
 
+# Longest dev_lock_ hold around the usb_host_* calls within the last diag period (10 s).
+# Not a counter: a peak that restarts at 0 every period, hence measurement.
+CONF_DEV_LOCK_HOLD_MAX = "dev_lock_hold_max"
+UNIT_MICROSECOND = "µs"  # not defined in esphome.const
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(CONF_USBIP_SERVER_ID): cv.use_id(USBIPServer),
@@ -68,6 +77,13 @@ CONFIG_SCHEMA = cv.Schema(
             )
             for key in _DIAG_COUNTERS
         },
+        cv.Optional(CONF_DEV_LOCK_HOLD_MAX): sensor.sensor_schema(
+            unit_of_measurement=UNIT_MICROSECOND,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            icon="mdi:timer-sand",
+        ),
     }
 )
 
@@ -81,3 +97,6 @@ async def to_code(config):
         if conf := config.get(key):
             sens = await sensor.new_sensor(conf)
             cg.add(getattr(server, f"set_{key}_sensor")(sens))
+    if conf := config.get(CONF_DEV_LOCK_HOLD_MAX):
+        sens = await sensor.new_sensor(conf)
+        cg.add(server.set_dev_lock_hold_max_sensor(sens))

@@ -18,8 +18,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <esp_timer.h>
 #include <freertos/task.h>
 #include <atomic>
+#include <cstdint>
 #include <string>
 
 namespace esphome::usbip_server {
@@ -65,6 +67,8 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(in_resubmitted)
   SUB_SENSOR(in_send_failed)
   SUB_SENSOR(cb_queue_full)
+  // Peak dev_lock_ hold time (us) around the usb_host_* calls since the last diag publish.
+  SUB_SENSOR(dev_lock_hold_max)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -130,12 +134,14 @@ class USBIPServer : public usb_host::USBClient {
   // USB task
   static void transfer_cb_(usb_transfer_t *xfer);
 
-  bool get_device_info_(usbip::DeviceInfo &out);
+  // timeout_ticks != portMAX_DELAY: gives up if dev_lock_ is busy (*busy = true, returns false).
+  bool get_device_info_(usbip::DeviceInfo &out, TickType_t timeout_ticks = portMAX_DELAY, bool *busy = nullptr);
   bool get_endpoint_(uint8_t address, usbip::EndpointInfo &out);
   bool device_ready_();
   void note_import_(int sock);   // TCP task: successful import (client + counter)
   void publish_entities_();      // main loop: state to entities, only on change
   void publish_diag_();          // main loop: diag counters to log/entities, only on change
+  void check_lock_watchdog_();   // main loop: reboot if dev_lock_ stays held in a usb_host_* section
   void release_interfaces_();
 
   uint16_t port_{3240};
@@ -148,6 +154,9 @@ class USBIPServer : public usb_host::USBClient {
   SemaphoreHandle_t dev_lock_{nullptr};
   usbip::DeviceInfo dev_info_{};  // guarded by dev_lock_
   bool dev_ready_{false};         // guarded by dev_lock_
+  // Mirror of dev_ready_ for the main loop (publish_entities_), so that task never waits for
+  // dev_lock_ in its 1 s path. Written only under dev_lock_ (on_connected/on_disconnected).
+  std::atomic<bool> dev_ready_pub_{false};
   usbip::EndpointInfo eps_[usbip::kMaxEndpoints];  // guarded by dev_lock_
   size_t ep_count_{0};                              // guarded by dev_lock_
   uint32_t claimed_mask_{0};                        // claimed interfaces (bit = number)
@@ -156,6 +165,47 @@ class USBIPServer : public usb_host::USBClient {
   static constexpr size_t MAX_CONFIG_DESC = 512;
   uint8_t cfg_filtered_[MAX_CONFIG_DESC];  // guarded by dev_lock_
   uint16_t cfg_filtered_len_{0};           // guarded by dev_lock_
+
+  // dev_lock_ hold tracking around the three sections that call usb_host_* (submit, cancel,
+  // clear). lock_since_us_ != 0 while such a section holds the lock; read by the main loop
+  // watchdog. 32-bit microsecond timestamps (wrap after ~71 min, differences stay valid for
+  // holds far shorter than that) keep the atomics at the native word size of the 32-bit core.
+  enum class LockSite : uint8_t { NONE = 0, SUBMIT = 1, CANCEL = 2, CLEAR = 3 };
+  static const char *lock_site_str_(uint8_t site);
+  static uint32_t lock_clock_us_() {
+    const uint32_t t = static_cast<uint32_t>(esp_timer_get_time());
+    return t != 0 ? t : 1;  // 0 is reserved for "not held"
+  }
+  std::atomic<uint32_t> lock_since_us_{0};
+  std::atomic<uint8_t> lock_site_{0};
+  std::atomic<uint32_t> dev_lock_hold_max_us_{0};  // written by the TCP task, read+reset by publish_diag_
+  uint32_t lock_watchdog_reboots_{0};              // main loop only; only meaningful in the log line
+
+  // RAII: takes dev_lock_ and records since when/where it is held (see above); the destructor
+  // clears the record, folds the hold time into dev_lock_hold_max_us_ and releases the lock.
+  class DevLockHold {
+   public:
+    DevLockHold(USBIPServer *s, LockSite site) : s_(s) {
+      xSemaphoreTake(s_->dev_lock_, portMAX_DELAY);
+      t0_ = lock_clock_us_();
+      s_->lock_site_.store(static_cast<uint8_t>(site), std::memory_order_relaxed);
+      s_->lock_since_us_.store(t0_, std::memory_order_release);  // after lock_site_: the reader sees both
+    }
+    ~DevLockHold() {
+      const uint32_t held = lock_clock_us_() - t0_;
+      s_->lock_since_us_.store(0, std::memory_order_relaxed);
+      uint32_t cur = s_->dev_lock_hold_max_us_.load(std::memory_order_relaxed);
+      while (held > cur && !s_->dev_lock_hold_max_us_.compare_exchange_weak(cur, held, std::memory_order_relaxed)) {
+      }
+      xSemaphoreGive(s_->dev_lock_);
+    }
+    DevLockHold(const DevLockHold &) = delete;
+    DevLockHold &operator=(const DevLockHold &) = delete;
+
+   private:
+    USBIPServer *s_;
+    uint32_t t0_{0};
+  };
 
   PendingSlot slots_[MAX_PENDING_LIMIT];
   QueueHandle_t done_queue_{nullptr};
@@ -197,11 +247,11 @@ class USBIPServer : public usb_host::USBClient {
   int8_t pub_client_{-1};
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
-  // Last published diag counters (main loop only), same order as in publish_diag_().
-  uint32_t diag_pub_[16] = {
-      0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-      0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-  };  // UINT32_MAX = "never published": the first publish_diag_ emits every value, zeros included
+  // Last published diag values (main loop only), same order as in publish_diag_(): the 16
+  // counters, then dev_lock_hold_max_us. setup() fills it with UINT32_MAX = "never published",
+  // so the first publish_diag_ emits every value, zeros included.
+  static constexpr size_t DIAG_COUNT = 17;
+  uint32_t diag_pub_[DIAG_COUNT]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
 

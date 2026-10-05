@@ -2,12 +2,14 @@
 #include "usbip_control.h"
 #include "usbip_urb.h"
 #include "esphome/components/network/util.h"
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <esp_heap_caps.h>
 #include <lwip/sockets.h>
 
@@ -18,6 +20,9 @@ static constexpr uint32_t TCP_TASK_STACK_SIZE = 6144;
 static constexpr UBaseType_t TCP_TASK_PRIORITY = 4;  // below the USB task (5), above the main loop
 static constexpr uint32_t SELECT_TIMEOUT_US = 2000;
 static constexpr uint32_t SESSION_DRAIN_TIMEOUT_MS = 2000;
+static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
+// A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
+static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
 
 static const char *parse_error_str(usbip::ParseError e) {
   switch (e) {
@@ -54,6 +59,7 @@ void USBIPServer::setup() {
     this->slots_[i].owner = this;
     this->slots_[i].index = i;
   }
+  std::fill(std::begin(this->diag_pub_), std::end(this->diag_pub_), UINT32_MAX);
   usb_host::USBClient::setup();
   // Entities may only be changed from the main loop; loop() may be disabled
   // (disable_loop), the scheduler runs regardless.
@@ -61,8 +67,40 @@ void USBIPServer::setup() {
   this->set_interval("diag", 10000, [this]() { this->publish_diag_(); });
 }
 
+const char *USBIPServer::lock_site_str_(uint8_t site) {
+  switch (static_cast<LockSite>(site)) {
+    case LockSite::SUBMIT:
+      return "submit_locked_";
+    case LockSite::CANCEL:
+      return "cancel_endpoint_";
+    case LockSite::CLEAR:
+      return "drain_completions_ clear";
+    default:
+      return "unknown";
+  }
+}
+
+// Main loop, every 1 s. The USB/IP TCP task holds dev_lock_ around usb_host_* calls that can wait
+// without a timeout inside ESP-IDF (e.g. usb_host_endpoint_halt). If that never returns, the TCP
+// task is wedged for good, so restart instead of waiting for the task watchdog to hit the main loop.
+void USBIPServer::check_lock_watchdog_() {
+  const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
+  if (since == 0) return;
+  const uint32_t held_us = lock_clock_us_() - since;
+  if (held_us <= LOCK_WATCHDOG_US) return;
+  // Re-check: the section may have finished (and a new one started) between the two reads.
+  if (this->lock_since_us_.load(std::memory_order_relaxed) != since) return;
+  const uint8_t site = this->lock_site_.load(std::memory_order_relaxed);
+  ++this->lock_watchdog_reboots_;
+  ESP_LOGE(TAG, "dev_lock_ held %u ms in %s (watchdog reboot #%u), rebooting", (unsigned) (held_us / 1000),
+           lock_site_str_(site), (unsigned) this->lock_watchdog_reboots_);
+  App.safe_reboot();
+}
+
 void USBIPServer::publish_entities_() {
-  const bool usb = this->device_ready_();
+  this->check_lock_watchdog_();
+  // dev_ready_pub_ instead of device_ready_(): this path must never wait for dev_lock_.
+  const bool usb = this->dev_ready_pub_.load(std::memory_order_relaxed);
   const uint32_t addr = this->client_addr_.load();
   const uint32_t imports = this->import_count_.load();
 #ifdef USE_BINARY_SENSOR
@@ -93,7 +131,7 @@ void USBIPServer::publish_entities_() {
 }
 
 void USBIPServer::publish_diag_() {
-  const uint32_t v[16] = {
+  const uint32_t v[DIAG_COUNT] = {
       this->in_submitted_.load(std::memory_order_relaxed),
       this->in_done_data_.load(std::memory_order_relaxed),
       this->in_done_empty_.load(std::memory_order_relaxed),
@@ -110,40 +148,42 @@ void USBIPServer::publish_diag_() {
       this->in_resubmitted_.load(std::memory_order_relaxed),
       this->in_send_failed_.load(std::memory_order_relaxed),
       this->cb_queue_full_.load(std::memory_order_relaxed),
+      this->dev_lock_hold_max_us_.exchange(0, std::memory_order_relaxed),  // peak since the last publish
   };
-  static const char *const kNames[16] = {
+  static const char *const kNames[DIAG_COUNT] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
       "out_done_ok",  "unlink_rx",    "dropped_silent", "stale_skip", "send_errors",    "slot_exhausted",
       "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
+      "dev_lock_hold_max_us",
   };
   bool any_changed = false;
-  for (int i = 0; i < 16; ++i) {
+  for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (v[i] != this->diag_pub_[i]) any_changed = true;
   }
   if (!any_changed) return;
 
   char line[480];
   int off = 0;
-  for (int i = 0; i < 16 && off < static_cast<int>(sizeof(line)); ++i) {
+  for (size_t i = 0; i < DIAG_COUNT && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
   }
   ESP_LOGI(TAG, "diag: %s", line);
 
 #ifdef USE_SENSOR
-  sensor::Sensor *const sensors[16] = {
+  sensor::Sensor *const sensors[DIAG_COUNT] = {
       this->in_submitted_sensor_, this->in_done_data_sensor_,  this->in_done_empty_sensor_,
       this->in_done_err_sensor_,  this->in_ret_sent_sensor_,   this->out_submitted_sensor_,
       this->out_done_ok_sensor_,  this->unlink_rx_sensor_,     this->dropped_silent_sensor_,
       this->stale_skip_sensor_,   this->send_errors_sensor_,   this->slot_exhausted_sensor_,
       this->unlink_discarded_sensor_, this->in_resubmitted_sensor_, this->in_send_failed_sensor_,
-      this->cb_queue_full_sensor_,
+      this->cb_queue_full_sensor_,     this->dev_lock_hold_max_sensor_,
   };
-  for (int i = 0; i < 16; ++i) {
+  for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
   }
 #endif
 
-  for (int i = 0; i < 16; ++i) this->diag_pub_[i] = v[i];
+  for (size_t i = 0; i < DIAG_COUNT; ++i) this->diag_pub_[i] = v[i];
 }
 
 void USBIPServer::note_import_(int sock) {
@@ -187,8 +227,12 @@ void USBIPServer::dump_config() {
                 (unsigned) this->dma_chunk_size_, this->max_pending_);
   ESP_LOGCONFIG(TAG, "  TCP listening: %s", this->tcp_listening_.load() ? "YES" : "NO");
   usbip::DeviceInfo d;
-  if (this->dev_lock_ != nullptr && this->get_device_info_(d)) {
+  bool busy = false;
+  if (this->dev_lock_ != nullptr &&
+      this->get_device_info_(d, pdMS_TO_TICKS(DUMP_CONFIG_LOCK_TIMEOUT_MS), &busy)) {
     ESP_LOGCONFIG(TAG, "  Exported device: %04X:%04X (%u interfaces)", d.idVendor, d.idProduct, d.bNumInterfaces);
+  } else if (busy) {
+    ESP_LOGCONFIG(TAG, "  Exported device: unknown (busy)");
   } else {
     ESP_LOGCONFIG(TAG, "  Exported device: none");
   }
@@ -274,6 +318,7 @@ void USBIPServer::on_connected() {
   for (size_t i = 0; i < ep_count; ++i) this->eps_[i] = eps[i];
   this->ep_count_ = ep_count;
   this->dev_ready_ = true;
+  this->dev_ready_pub_.store(true, std::memory_order_relaxed);
   xSemaphoreGive(this->dev_lock_);
 
   ESP_LOGI(TAG, "Exporting %04X:%04X as busid %s (%u interfaces claimed, %u endpoints, speed %u)", d.idVendor,
@@ -301,14 +346,18 @@ void USBIPServer::on_disconnected() {
   // Stop new transfers first (the TCP task submits under the same lock).
   xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
   this->dev_ready_ = false;
+  this->dev_ready_pub_.store(false, std::memory_order_relaxed);
   xSemaphoreGive(this->dev_lock_);
   this->release_interfaces_();
   ESP_LOGW(TAG, "USB device gone, nothing to export");
   usb_host::USBClient::on_disconnected();
 }
 
-bool USBIPServer::get_device_info_(usbip::DeviceInfo &out) {
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+bool USBIPServer::get_device_info_(usbip::DeviceInfo &out, TickType_t timeout_ticks, bool *busy) {
+  if (xSemaphoreTake(this->dev_lock_, timeout_ticks) != pdTRUE) {
+    if (busy != nullptr) *busy = true;
+    return false;
+  }
   bool ready = this->dev_ready_;
   if (ready) out = this->dev_info_;
   xSemaphoreGive(this->dev_lock_);
@@ -671,22 +720,16 @@ int USBIPServer::serve_client_(int sock, int listen_sock, const char *takeover_b
 }
 
 esp_err_t USBIPServer::submit_locked_(usb_transfer_t *x, bool is_control) {
-  esp_err_t err;
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
-  if (!this->dev_ready_) {
-    err = ESP_ERR_INVALID_STATE;
-  } else {
-    x->device_handle = this->device_handle_;
-    err = is_control ? usb_host_transfer_submit_control(this->handle_, x) : usb_host_transfer_submit(x);
-  }
-  xSemaphoreGive(this->dev_lock_);
-  return err;
+  DevLockHold hold(this, LockSite::SUBMIT);
+  if (!this->dev_ready_) return ESP_ERR_INVALID_STATE;
+  x->device_handle = this->device_handle_;
+  return is_control ? usb_host_transfer_submit_control(this->handle_, x) : usb_host_transfer_submit(x);
 }
 
 // Cancels all transfers on the endpoint (ESP-IDF cannot cancel a single transfer).
 // Sequence halt -> flush -> clear follows usbipdcpp_esp32 (cancel_endpoint_all_transfers).
 void USBIPServer::cancel_endpoint_(uint8_t ep_addr) {
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+  DevLockHold hold(this, LockSite::CANCEL);
   if (this->dev_ready_) {
     esp_err_t e1 = usb_host_endpoint_halt(this->device_handle_, ep_addr);
     esp_err_t e2 = usb_host_endpoint_flush(this->device_handle_, ep_addr);
@@ -698,7 +741,6 @@ void USBIPServer::cancel_endpoint_(uint8_t ep_addr) {
       ESP_LOGV(TAG, "Cancel ep %02X: ok", ep_addr);
     }
   }
-  xSemaphoreGive(this->dev_lock_);
 }
 
 uint8_t *USBIPServer::alloc_big_(size_t size) {
@@ -1052,12 +1094,11 @@ bool USBIPServer::drain_completions_(int sock) {
     }
 
     if (s.clear_halt_ep != 0 && x->status == USB_TRANSFER_STATUS_COMPLETED) {
-      xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+      DevLockHold hold(this, LockSite::CLEAR);
       if (this->dev_ready_) {
         esp_err_t err = usb_host_endpoint_clear(this->device_handle_, s.clear_halt_ep);
         ESP_LOGD(TAG, "CLEAR_HALT ep %02X host side: %s", s.clear_halt_ep, esp_err_to_name(err));
       }
-      xSemaphoreGive(this->dev_lock_);
     }
 
     if (ok && !s.orphan && sock >= 0) {
