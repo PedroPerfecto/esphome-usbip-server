@@ -194,6 +194,7 @@ class USBIPServer : public usb_host::USBClient {
   void publish_entities_();      // main loop: state to entities, only on change
   void publish_diag_();          // main loop: diag counters to log/entities, only on change
   void check_lock_watchdog_();   // main loop: reboot if dev_lock_ stays held in a usb_host_* section
+  void check_intr_setup_stuck_();  // main loop: reboot if the interrupt setup stays postponed
   // Main loop only. Store a record of a long dev_lock_ wait in RTC_NOINIT memory (survives the
   // reboot that follows), see usbip_server.cpp.
   void record_lock_event_(uint8_t kind);
@@ -217,6 +218,11 @@ class USBIPServer : public usb_host::USBClient {
   bool intr_session_{false};         // an import is active (TCP task)
   uint8_t *intr_out_buf_{nullptr};   // RET_SUBMIT data assembled from the ring (dma_chunk_size_ B)
   std::atomic<uint32_t> prefetch_in_flight_{0};
+  std::atomic<uint32_t> intr_out_in_flight_{0};  // interrupt OUT slots submitted, callback not run yet
+  // setup_intr_eps_ postponed since (now_ms_, 0 = not postponed) and with how many transfers in flight;
+  // written by the TCP task, read by check_intr_setup_stuck_ (main loop).
+  std::atomic<uint32_t> intr_setup_postponed_ms_{0};
+  std::atomic<uint32_t> intr_setup_postponed_count_{0};
   std::atomic<uint32_t> dev_generation_{0};  // ++ in on_connected (under dev_lock_)
 
   SemaphoreHandle_t dev_lock_{nullptr};

@@ -28,8 +28,10 @@ static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
 // Interrupt OUT after CMD_UNLINK: RET_UNLINK at the latest after this long, then the slot is an orphan.
 static constexpr uint32_t OUT_UNLINK_WAIT_MS = 5000;
-// on_disconnected (main loop): bounded wait for the prefetch transfers to complete (NO_DEVICE) before
-// releasing the interfaces; far below the lock watchdog (10 s) and the task watchdog (5 s).
+// Interrupt setup postponed this long (transfers of the previous device still in flight): reboot.
+static constexpr uint32_t INTR_SETUP_STUCK_MS = 10000;
+// on_disconnected (main loop): bounded wait for the prefetch and interrupt OUT transfers to complete
+// (NO_DEVICE) before releasing the interfaces; far below the lock watchdog (10 s) and the task watchdog (5 s).
 static constexpr uint32_t DISCONNECT_PREFETCH_WAIT_MS = 500;
 static constexpr uint32_t DISCONNECT_PREFETCH_POLL_MS = 10;
 
@@ -65,6 +67,7 @@ enum LockDiagKind : uint8_t {
   KIND_WATCHDOG_REBOOT = 1,
   KIND_CONNECT_WAIT = 2,
   KIND_DISCONNECT_WAIT = 3,
+  KIND_INTR_SETUP_STUCK = 4,  // interrupt setup postponed too long: old prefetch transfers never completed
 };
 struct LockDiagRecord {
   uint32_t magic;
@@ -99,6 +102,8 @@ const char *lock_diag_kind_str(uint8_t kind) {
       return "CONNECT_WAIT";
     case KIND_DISCONNECT_WAIT:
       return "DISCONNECT_WAIT";
+    case KIND_INTR_SETUP_STUCK:
+      return "INTR_SETUP_STUCK";
     default:
       return "unknown";
   }
@@ -142,7 +147,7 @@ void USBIPServer::setup() {
 void USBIPServer::load_lock_diag_() {
   char text[96] = "žiadny";
   const LockDiagRecord rec = s_lock_diag;
-  if (rec.magic == LOCK_DIAG_MAGIC && rec.kind >= KIND_WATCHDOG_REBOOT && rec.kind <= KIND_DISCONNECT_WAIT &&
+  if (rec.magic == LOCK_DIAG_MAGIC && rec.kind >= KIND_WATCHDOG_REBOOT && rec.kind <= KIND_INTR_SETUP_STUCK &&
       rec.site <= static_cast<uint8_t>(LockSite::CLEAR)) {
     snprintf(text, sizeof(text), "%s site=%s held=%u ms uptime=%u ms", lock_diag_kind_str(rec.kind),
              lock_site_str_(rec.site), (unsigned) rec.held_ms, (unsigned) rec.uptime_ms);
@@ -192,6 +197,7 @@ const char *USBIPServer::lock_site_str_(uint8_t site) {
 // without a timeout inside ESP-IDF (e.g. usb_host_endpoint_halt). If that never returns, the TCP
 // task is wedged for good, so restart instead of waiting for the task watchdog to hit the main loop.
 void USBIPServer::check_lock_watchdog_() {
+  this->check_intr_setup_stuck_();
   const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
   if (since == 0) return;
   const uint32_t held_us = lock_clock_us_() - since;  // modulo 2^32: correct across a 32-bit wrap
@@ -204,6 +210,28 @@ void USBIPServer::check_lock_watchdog_() {
            lock_site_str_(site), (unsigned) this->lock_watchdog_reboots_);
   // Written last: safe_reboot() is the point of no return, the record is what the next boot reports.
   store_lock_diag(KIND_WATCHDOG_REBOOT, site, held_us / 1000);
+  App.safe_reboot();
+}
+
+// Main loop, every 1 s (from check_lock_watchdog_). setup_intr_eps_ (TCP task) postpones the
+// interrupt setup while transfers of the previous device are in flight. They complete with NO_DEVICE
+// right after the disconnect; if they still have not after INTR_SETUP_STUCK_MS, the USB stack is not
+// returning them and interrupt IN cannot be served any more: leave a record and restart.
+void USBIPServer::check_intr_setup_stuck_() {
+  const uint32_t since = this->intr_setup_postponed_ms_.load(std::memory_order_acquire);
+  if (since == 0) return;
+  const uint32_t waited = now_ms_() - since;  // modulo 2^32
+  if (waited <= INTR_SETUP_STUCK_MS) return;
+  if (this->intr_setup_postponed_ms_.load(std::memory_order_relaxed) != since) return;  // cleared meanwhile
+  // The callbacks did run (the TCP task only has not drained them yet, e.g. no session to retry the
+  // setup): not stuck, the next setup_intr_eps_ succeeds.
+  if (this->prefetch_in_flight_.load(std::memory_order_acquire) == 0) return;
+  ESP_LOGE(TAG, "Interrupt setup postponed for %u ms, %u prefetch transfer(s) still in flight (TCP task view %u), "
+                "rebooting",
+           (unsigned) waited, (unsigned) this->prefetch_in_flight_.load(std::memory_order_relaxed),
+           (unsigned) this->intr_setup_postponed_count_.load(std::memory_order_relaxed));
+  // Written last: safe_reboot() is the point of no return, the record is what the next boot reports.
+  store_lock_diag(KIND_INTR_SETUP_STUCK, 0, waited);
   App.safe_reboot();
 }
 
@@ -477,15 +505,20 @@ void USBIPServer::on_disconnected() {
   // The stack flushes the prefetch transfers of a gone device with NO_DEVICE (no halt wait, the port
   // is invalid) and prefetch_cb_ runs in the USB task, so a short wait here is enough. No new prefetch
   // can start: submit_locked_ checks dev_ready_ under dev_lock_.
-  for (uint32_t waited = 0; this->prefetch_in_flight_.load(std::memory_order_acquire) != 0 &&
+  // Interrupt OUT slots count too (they are never cancelled either); bulk is cancelled by the stack's
+  // own flush the same way, but not waited for here (unchanged).
+  for (uint32_t waited = 0; (this->prefetch_in_flight_.load(std::memory_order_acquire) != 0 ||
+                             this->intr_out_in_flight_.load(std::memory_order_acquire) != 0) &&
                             waited < DISCONNECT_PREFETCH_WAIT_MS;
        waited += DISCONNECT_PREFETCH_POLL_MS) {
     vTaskDelay(pdMS_TO_TICKS(DISCONNECT_PREFETCH_POLL_MS));
   }
-  const uint32_t left = this->prefetch_in_flight_.load(std::memory_order_acquire);
-  if (left != 0) {
-    ESP_LOGW(TAG, "%u prefetch transfer(s) still in flight after %u ms, releasing interfaces anyway", (unsigned) left,
-             (unsigned) DISCONNECT_PREFETCH_WAIT_MS);
+  const uint32_t left_pf = this->prefetch_in_flight_.load(std::memory_order_acquire);
+  const uint32_t left_out = this->intr_out_in_flight_.load(std::memory_order_acquire);
+  if (left_pf != 0 || left_out != 0) {
+    ESP_LOGW(TAG,
+             "Still in flight after %u ms: %u prefetch, %u interrupt OUT transfer(s); releasing interfaces anyway",
+             (unsigned) DISCONNECT_PREFETCH_WAIT_MS, (unsigned) left_pf, (unsigned) left_out);
   }
   this->release_interfaces_();
   ESP_LOGW(TAG, "USB device gone, nothing to export");
@@ -523,10 +556,14 @@ bool USBIPServer::device_ready_() {
 
 void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   auto *slot = static_cast<PendingSlot *>(xfer->context);
+  // Read before the queue send: after it the TCP task may free and reuse the slot. is_intr was set
+  // by the TCP task before the submit and does not change while the transfer is in flight.
+  const bool intr_out = slot->is_intr && !slot->dir_in;
   // The queue has room for every slot. Runs in usb_task (a FreeRTOS task, not an ISR).
   if (xQueueSend(slot->owner->done_queue_, &slot->index, 0) != pdTRUE) {
     slot->owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
   }
+  if (intr_out) slot->owner->intr_out_in_flight_.fetch_sub(1, std::memory_order_release);
 }
 
 // USB task. Same as transfer_cb_, for the prefetch transfers of interrupt IN endpoints.
@@ -1012,8 +1049,11 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
              e.type == usbip::kEpTypeBulk ? "BULK" : "INTR", addr, (unsigned) requested, (unsigned) num_bytes);
   }
 
+  // Interrupt OUT in flight (on_disconnected waits for it): counted before the submit, the callback decrements.
+  if (slot->is_intr) this->intr_out_in_flight_.fetch_add(1, std::memory_order_relaxed);
   esp_err_t err = this->submit_locked_(x, false);
   if (err != ESP_OK) {
+    if (slot->is_intr) this->intr_out_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     this->free_slot_(*slot);
     ESP_LOGW(TAG, "seq %u: ep %02X submit failed: %s -> -EPIPE", (unsigned) seq, addr, esp_err_to_name(err));
     return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
@@ -1422,13 +1462,23 @@ bool USBIPServer::setup_intr_eps_() {
 
   // Transfers of the previous device can only be freed after their completion was drained
   // (NO_DEVICE). Normally done by drain_completions_ before this call; otherwise retry later.
+  // check_intr_setup_stuck_ (main loop) reboots if this lasts longer than INTR_SETUP_STUCK_MS.
+  uint32_t still = 0;
   for (const PrefetchXfer &pf : this->prefetch_) {
-    if (pf.in_flight) {
-      ESP_LOGW(TAG, "Prefetch transfer of the previous device still in flight, interrupt setup postponed");
-      this->intr_configured_ = false;
-      return false;
-    }
+    if (pf.in_flight) ++still;
   }
+  if (still != 0) {
+    this->intr_configured_ = false;
+    this->intr_setup_postponed_count_.store(still, std::memory_order_relaxed);
+    if (this->intr_setup_postponed_ms_.load(std::memory_order_relaxed) == 0) {
+      const uint32_t now = now_ms_();
+      this->intr_setup_postponed_ms_.store(now != 0 ? now : 1, std::memory_order_release);  // 0 = not postponed
+      ESP_LOGW(TAG, "%u prefetch transfer(s) of the previous device still in flight, interrupt setup postponed",
+               (unsigned) still);
+    }
+    return false;
+  }
+  this->intr_setup_postponed_ms_.store(0, std::memory_order_release);
   for (PrefetchXfer &pf : this->prefetch_) {
     if (pf.xfer != nullptr) usb_host_transfer_free(pf.xfer);
     pf.xfer = nullptr;
