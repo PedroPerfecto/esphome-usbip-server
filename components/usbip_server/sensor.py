@@ -32,6 +32,14 @@ CONF_UNLINK_DISCARDED = "unlink_discarded"
 CONF_IN_RESUBMITTED = "in_resubmitted"
 CONF_IN_SEND_FAILED = "in_send_failed"
 CONF_CB_QUEUE_FULL = "cb_queue_full"
+# Interrupt endpoints without HALT (usbip_intrq.h): counters since boot, total_increasing.
+CONF_INTR_Q_FULL = "intr_q_full"
+CONF_INTR_DROPPED_NOSESSION = "intr_dropped_nosession"
+CONF_INTR_FLUSHED_IMPORT = "intr_flushed_import"
+CONF_INTR_UNLINK_WAITING = "intr_unlink_waiting"
+CONF_OUT_UNLINK_WAIT_TIMEOUT = "out_unlink_wait_timeout"
+CONF_INTR_OVERFLOW = "intr_overflow"
+CONF_INTR_ZLP_DROPPED = "intr_zlp_dropped"
 
 _DIAG_COUNTERS = (
     CONF_IN_SUBMITTED,
@@ -50,12 +58,23 @@ _DIAG_COUNTERS = (
     CONF_IN_RESUBMITTED,
     CONF_IN_SEND_FAILED,
     CONF_CB_QUEUE_FULL,
+    CONF_INTR_Q_FULL,
+    CONF_INTR_DROPPED_NOSESSION,
+    CONF_INTR_FLUSHED_IMPORT,
+    CONF_INTR_UNLINK_WAITING,
+    CONF_OUT_UNLINK_WAIT_TIMEOUT,
+    CONF_INTR_OVERFLOW,
+    CONF_INTR_ZLP_DROPPED,
 )
 
 # Longest dev_lock_ hold around the usb_host_* calls within the last diag period (10 s).
 # Not a counter: a peak that restarts at 0 every period, hence measurement.
 CONF_DEV_LOCK_HOLD_MAX = "dev_lock_hold_max"
 UNIT_MICROSECOND = "µs"  # not defined in esphome.const
+
+# Highest number of packets stored in an interrupt IN queue within the last diag period (10 s).
+# A peak that restarts every period, hence measurement.
+CONF_INTR_Q_DEPTH_MAX = "intr_q_depth_max"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -84,6 +103,12 @@ CONFIG_SCHEMA = cv.Schema(
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             icon="mdi:timer-sand",
         ),
+        cv.Optional(CONF_INTR_Q_DEPTH_MAX): sensor.sensor_schema(
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            icon="mdi:tray-full",
+        ),
     }
 )
 
@@ -100,3 +125,6 @@ async def to_code(config):
     if conf := config.get(CONF_DEV_LOCK_HOLD_MAX):
         sens = await sensor.new_sensor(conf)
         cg.add(server.set_dev_lock_hold_max_sensor(sens))
+    if conf := config.get(CONF_INTR_Q_DEPTH_MAX):
+        sens = await sensor.new_sensor(conf)
+        cg.add(server.set_intr_q_depth_max_sensor(sens))

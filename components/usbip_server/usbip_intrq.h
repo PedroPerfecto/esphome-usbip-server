@@ -61,13 +61,17 @@ class IntrRing {
 struct IntrRequest {
   uint32_t seqnum{0};
   uint32_t length{0};  // transfer_buffer_length from CMD_SUBMIT
+  // Echoed back in RET_SUBMIT, as for every other transfer.
+  uint32_t start_frame{0};
+  uint32_t number_of_packets{0};
 };
 
 class IntrWaitFifo {
  public:
   static constexpr uint8_t kCapacity = 32;  // = MAX_PENDING_LIMIT of the server
 
-  bool push(uint32_t seqnum, uint32_t length);  // false if full
+  bool push(uint32_t seqnum, uint32_t length, uint32_t start_frame = 0,
+            uint32_t number_of_packets = 0);  // false if full
   const IntrRequest &front() const { return items_[0]; }  // size() > 0
   void pop_front();
   // CMD_UNLINK: removes the request with this seqnum, keeps the order of the others.
@@ -127,7 +131,12 @@ class IntrInQueue {
   bool init(uint16_t depth, uint16_t mps) { return this->ring_.init(depth, mps); }
 
   // CMD_SUBMIT IN. Returns false if the FIFO is full (request not stored).
-  bool add_request(uint32_t seqnum, uint32_t length, uint32_t now_ms);
+  bool add_request(uint32_t seqnum, uint32_t length, uint32_t now_ms, uint32_t start_frame = 0,
+                   uint32_t number_of_packets = 0);
+  // Removes the oldest waiting request (e.g. to fail it); false if none.
+  bool pop_request(IntrRequest *out);
+  // Session ended: drop the waiting requests, keep the stored packets.
+  void clear_waiting() { this->waiting_.clear(); }
   // CMD_UNLINK of a waiting request; false if not waiting (already answered or unknown).
   bool unlink(uint32_t seqnum) { return this->waiting_.remove(seqnum); }
   // Received packet from a prefetch transfer; false if the ring is full (packet dropped).
@@ -138,7 +147,12 @@ class IntrInQueue {
   bool front_ready(uint32_t *seqnum, IntrServePlan *plan) const;
   void complete_front(const IntrServePlan &plan, uint8_t *out);
 
-  bool should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms = kDefaultPrefetchWindowMs) const;
+  // A request is waiting or the last one came less than window_ms ago (the client is reading).
+  bool request_active(uint32_t now_ms, uint32_t window_ms = kDefaultPrefetchWindowMs) const;
+  // reserved: ring entries already promised to transfers in flight; the ring counts as full when
+  // size() + reserved >= depth(), so every completion of those transfers still has room.
+  bool should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms = kDefaultPrefetchWindowMs,
+                       uint16_t reserved = 0) const;
 
   // New import: drop stored packets and waiting requests, forget the last request time.
   void reset();

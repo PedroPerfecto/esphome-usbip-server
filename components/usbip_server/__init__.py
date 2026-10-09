@@ -12,6 +12,7 @@ CONF_MAX_TRANSFER_SIZE = "max_transfer_size"
 CONF_MAX_PENDING = "max_pending"
 CONF_DMA_CHUNK_SIZE = "dma_chunk_size"
 CONF_INTERFACES = "interfaces"
+CONF_INTERRUPT_QUEUE_DEPTH = "interrupt_queue_depth"
 CONF_USBIP_SERVER_ID = "usbip_server_id"
 
 usbip_server_ns = cg.esphome_ns.namespace("usbip_server")
@@ -38,6 +39,8 @@ CONFIG_SCHEMA = cv.COMPONENT_SCHEMA.extend(
         # largest single USB transfer in internal RAM (DMA); larger bulk transfers are split
         cv.Optional(CONF_DMA_CHUNK_SIZE, default=16384): cv.int_range(min=64, max=65536),
         cv.Optional(CONF_MAX_PENDING, default=16): cv.int_range(min=1, max=32),
+        # packets stored per interrupt IN endpoint (prefetch without HALT); one entry = one packet <= MPS
+        cv.Optional(CONF_INTERRUPT_QUEUE_DEPTH, default=32): cv.int_range(min=4, max=256),
         # exported interface numbers (bInterfaceNumber); omitted = all
         cv.Optional(CONF_INTERFACES): cv.All(
             cv.ensure_list(cv.int_range(min=0, max=31)), cv.Length(min=1)
@@ -53,6 +56,7 @@ async def to_code(config):
     cg.add(var.set_max_transfer_size(config[CONF_MAX_TRANSFER_SIZE]))
     cg.add(var.set_max_pending(config[CONF_MAX_PENDING]))
     cg.add(var.set_dma_chunk_size(config[CONF_DMA_CHUNK_SIZE]))
+    cg.add(var.set_interrupt_queue_depth(config[CONF_INTERRUPT_QUEUE_DEPTH]))
     if CONF_INTERFACES in config:
         mask = 0
         for i in config[CONF_INTERFACES]:

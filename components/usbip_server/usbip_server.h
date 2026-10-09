@@ -14,6 +14,7 @@
 #include "usbip_device.h"
 #include "usbip_endpoints.h"
 #include "usbip_filter.h"
+#include "usbip_intrq.h"
 #include "usbip_stream.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -27,6 +28,10 @@
 namespace esphome::usbip_server {
 
 static constexpr uint8_t MAX_PENDING_LIMIT = 32;
+// Interrupt IN endpoints served from server-owned prefetch transfers (no HALT, see usbip_intrq.h).
+static constexpr uint8_t MAX_INTR_IN_EPS = 4;
+static constexpr uint8_t PREFETCH_PER_EP = 2;
+static constexpr uint8_t PREFETCH_COUNT = MAX_INTR_IN_EPS * PREFETCH_PER_EP;
 
 // USB/IP server on top of ESPHome usb_host.
 // Import, control transfers on ep0, interrupt and bulk transfers (large bulk
@@ -71,6 +76,15 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(cb_queue_full)
   // Peak dev_lock_ hold time (us) around the usb_host_* calls since the last diag publish.
   SUB_SENSOR(dev_lock_hold_max)
+  // Interrupt endpoints without HALT (see usbip_server.cpp for exact count points).
+  SUB_SENSOR(intr_q_depth_max)
+  SUB_SENSOR(intr_q_full)
+  SUB_SENSOR(intr_dropped_nosession)
+  SUB_SENSOR(intr_flushed_import)
+  SUB_SENSOR(intr_unlink_waiting)
+  SUB_SENSOR(out_unlink_wait_timeout)
+  SUB_SENSOR(intr_overflow)
+  SUB_SENSOR(intr_zlp_dropped)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -79,6 +93,7 @@ class USBIPServer : public usb_host::USBClient {
   void set_max_pending(uint8_t count) { this->max_pending_ = count; }
   void set_dma_chunk_size(uint32_t size) { this->dma_chunk_size_ = size; }
   void set_interface_mask(uint32_t mask) { this->interface_mask_ = mask; }
+  void set_interrupt_queue_depth(uint16_t depth) { this->interrupt_queue_depth_ = depth; }
 
  protected:
   // Pending URB. Only the TCP task modifies it; the USB task only posts the index to the queue.
@@ -96,6 +111,8 @@ class USBIPServer : public usb_host::USBClient {
     bool used{false};
     bool dir_in{false};
     bool is_control{false};
+    bool is_intr{false};         // interrupt endpoint (only OUT uses slots, IN is served by IntrInEp)
+    uint32_t unlink_deadline_ms{0};  // interrupt OUT with unlink_pending: RET_UNLINK at the latest then
     bool orphan{false};          // connection ended, just release
     bool unlink_pending{false};  // client sent CMD_UNLINK, reply with RET_UNLINK
     bool chunked{false};         // large bulk transfer split into chunks
@@ -135,6 +152,39 @@ class USBIPServer : public usb_host::USBClient {
 
   // USB task
   static void transfer_cb_(usb_transfer_t *xfer);
+  static void prefetch_cb_(usb_transfer_t *xfer);
+
+  // Interrupt IN without HALT. Everything below runs in the TCP task only, except
+  // prefetch_in_flight_ (also decremented by prefetch_cb_ in the USB task and read by on_disconnected).
+  struct IntrInEp;
+  struct PrefetchXfer {
+    USBIPServer *owner{nullptr};
+    IntrInEp *ep{nullptr};
+    usb_transfer_t *xfer{nullptr};
+    uint8_t index{0};        // done_queue_ value: MAX_PENDING_LIMIT + position in prefetch_
+    bool in_flight{false};   // submitted, completion not drained yet (TCP task view)
+  };
+  struct IntrInEp {
+    bool active{false};
+    uint8_t addr{0};
+    uint16_t mps{0};
+    usbip::IntrInQueue q;
+    PrefetchXfer *pf[PREFETCH_PER_EP]{};
+    bool stalled{false};     // a prefetch transfer ended with STALL; only a forwarded CLEAR_FEATURE(HALT) resumes
+    bool need_clear{false};  // pipe halted by a transfer error (not STALL): clear on the host before resubmitting
+    bool blocked_full{false};  // prefetch wanted but held back by a full ring (for intr_q_full transitions)
+  };
+  static uint32_t now_ms_() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+  IntrInEp *find_intr_in_(uint8_t addr);
+  bool setup_intr_eps_();             // (re)configures intr_in_ for the current device generation
+  void intr_on_import_();             // new import: reset the queues, start the session state
+  bool handle_intr_in_submit_(int sock, const usbip::Message &m, const usbip::EndpointInfo &e);
+  bool serve_intr_ep_(int sock, IntrInEp &ep);  // answers waiting requests from the ring
+  bool fail_waiting_(int sock, IntrInEp &ep, int32_t status);
+  void pump_prefetch_(IntrInEp &ep, uint32_t now);
+  bool handle_prefetch_done_(int sock, uint8_t pf_index);
+  bool intr_service_(int sock);       // serve_client_ loop: prefetch window, OUT unlink timeouts, peak depth
+  uint16_t pf_in_flight_(const IntrInEp &ep) const;
 
   // timeout_ticks != portMAX_DELAY: gives up if dev_lock_ is busy (*busy = true, returns false).
   bool get_device_info_(usbip::DeviceInfo &out, TickType_t timeout_ticks = portMAX_DELAY, bool *busy = nullptr);
@@ -158,6 +208,16 @@ class USBIPServer : public usb_host::USBClient {
   uint8_t max_pending_{16};
   uint32_t dma_chunk_size_{16384};
   uint32_t interface_mask_{usbip::kAllInterfaces};
+  uint16_t interrupt_queue_depth_{usbip::IntrRing::kDefaultDepth};
+
+  IntrInEp intr_in_[MAX_INTR_IN_EPS];
+  PrefetchXfer prefetch_[PREFETCH_COUNT];
+  uint32_t intr_generation_{0};      // device generation intr_in_ was set up for (TCP task)
+  bool intr_configured_{false};      // intr_in_ matches intr_generation_ (TCP task)
+  bool intr_session_{false};         // an import is active (TCP task)
+  uint8_t *intr_out_buf_{nullptr};   // RET_SUBMIT data assembled from the ring (dma_chunk_size_ B)
+  std::atomic<uint32_t> prefetch_in_flight_{0};
+  std::atomic<uint32_t> dev_generation_{0};  // ++ in on_connected (under dev_lock_)
 
   SemaphoreHandle_t dev_lock_{nullptr};
   usbip::DeviceInfo dev_info_{};  // guarded by dev_lock_
@@ -248,7 +308,16 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> unlink_discarded_{0};  // drain_completions_: IN COMPLETED with data, but only RET_UNLINK sent
   std::atomic<uint32_t> in_resubmitted_{0};    // drain_completions_: IN collateral cancel, resubmit succeeded
   std::atomic<uint32_t> in_send_failed_{0};    // drain_completions_: RET_SUBMIT send failed for IN COMPLETED data
-  std::atomic<uint32_t> cb_queue_full_{0};     // transfer_cb_ (USB task): xQueueSend to done_queue_ failed
+  std::atomic<uint32_t> cb_queue_full_{0};     // transfer_cb_/prefetch_cb_ (USB task): xQueueSend to done_queue_ failed
+  // Interrupt endpoints without HALT:
+  std::atomic<uint32_t> intr_q_depth_max_{0};        // peak ring size over all IN eps, read+reset by publish_diag_
+  std::atomic<uint32_t> intr_q_full_{0};             // prefetch held back by a full ring (transitions) or packet dropped
+  std::atomic<uint32_t> intr_dropped_nosession_{0};  // prefetch packet received without an active session
+  std::atomic<uint32_t> intr_flushed_import_{0};     // packets left in the ring and dropped at a new import
+  std::atomic<uint32_t> intr_unlink_waiting_{0};     // CMD_UNLINK of a waiting IN request (no USB operation)
+  std::atomic<uint32_t> out_unlink_wait_timeout_{0};  // interrupt OUT did not finish 5 s after CMD_UNLINK
+  std::atomic<uint32_t> intr_overflow_{0};           // IN request shorter than the packet -> -EOVERFLOW
+  std::atomic<uint32_t> intr_zlp_dropped_{0};        // prefetch completed with 0 B, not stored
 
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
@@ -256,9 +325,9 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag values (main loop only), same order as in publish_diag_(): the 16
-  // counters, then dev_lock_hold_max_us. setup() fills it with UINT32_MAX = "never published",
-  // so the first publish_diag_ emits every value, zeros included.
-  static constexpr size_t DIAG_COUNT = 17;
+  // counters, dev_lock_hold_max_us, then the 8 interrupt values. setup() fills it with
+  // UINT32_MAX = "never published", so the first publish_diag_ emits every value, zeros included.
+  static constexpr size_t DIAG_COUNT = 25;
   uint32_t diag_pub_[DIAG_COUNT]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };

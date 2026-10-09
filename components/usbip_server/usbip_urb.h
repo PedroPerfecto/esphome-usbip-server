@@ -9,6 +9,7 @@ namespace usbip {
 // on the ESP32, where they may differ.
 constexpr int32_t kLinuxENOENT = -2;
 constexpr int32_t kLinuxEPIPE = -32;
+constexpr int32_t kLinuxEOVERFLOW = -75;
 constexpr int32_t kLinuxECONNRESET = -104;
 constexpr int32_t kLinuxESHUTDOWN = -108;
 

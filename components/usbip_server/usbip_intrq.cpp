@@ -64,10 +64,12 @@ uint16_t IntrRing::take_peak() {
 
 // ---------------------------------------------------------------- IntrWaitFifo
 
-bool IntrWaitFifo::push(uint32_t seqnum, uint32_t length) {
+bool IntrWaitFifo::push(uint32_t seqnum, uint32_t length, uint32_t start_frame, uint32_t number_of_packets) {
   if (this->full()) return false;
   this->items_[this->count_].seqnum = seqnum;
   this->items_[this->count_].length = length;
+  this->items_[this->count_].start_frame = start_frame;
+  this->items_[this->count_].number_of_packets = number_of_packets;
   ++this->count_;
   return true;
 }
@@ -163,10 +165,18 @@ bool prefetch_allowed(bool session_active, bool ring_full, bool request_waiting,
 
 // ---------------------------------------------------------------- IntrInQueue
 
-bool IntrInQueue::add_request(uint32_t seqnum, uint32_t length, uint32_t now_ms) {
-  if (!this->waiting_.push(seqnum, length)) return false;
+bool IntrInQueue::add_request(uint32_t seqnum, uint32_t length, uint32_t now_ms, uint32_t start_frame,
+                              uint32_t number_of_packets) {
+  if (!this->waiting_.push(seqnum, length, start_frame, number_of_packets)) return false;
   this->last_request_ms_ = now_ms;
   this->have_last_request_ = true;
+  return true;
+}
+
+bool IntrInQueue::pop_request(IntrRequest *out) {
+  if (this->waiting_.empty()) return false;
+  if (out != nullptr) *out = this->waiting_.front();
+  this->waiting_.pop_front();
   return true;
 }
 
@@ -185,9 +195,16 @@ void IntrInQueue::complete_front(const IntrServePlan &plan, uint8_t *out) {
   this->waiting_.pop_front();
 }
 
-bool IntrInQueue::should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms) const {
-  return prefetch_allowed(session_active, this->ring_.full(), !this->waiting_.empty(), this->have_last_request_,
+bool IntrInQueue::should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms,
+                                  uint16_t reserved) const {
+  const bool full = static_cast<uint32_t>(this->ring_.size()) + reserved >= this->ring_.depth();
+  return prefetch_allowed(session_active, full, !this->waiting_.empty(), this->have_last_request_,
                           this->last_request_ms_, now_ms, window_ms);
+}
+
+bool IntrInQueue::request_active(uint32_t now_ms, uint32_t window_ms) const {
+  return prefetch_allowed(true, false, !this->waiting_.empty(), this->have_last_request_, this->last_request_ms_,
+                          now_ms, window_ms);
 }
 
 void IntrInQueue::reset() {

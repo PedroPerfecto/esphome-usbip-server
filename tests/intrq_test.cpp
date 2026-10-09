@@ -386,3 +386,43 @@ TEST_CASE("queue: should_prefetch follows requests, window and full ring") {
   for (int i = 0; i < 4; ++i) push(q, 1, 0);  // ring full (short packets)
   CHECK_FALSE(q.should_prefetch(true, 200));  // full ring wins over a waiting request
 }
+
+// ---------------------------------------------------------------- helpers used by the server (I2)
+
+TEST_CASE("queue: start_frame/number_of_packets are kept with the request") {
+  IntrInQueue q;
+  REQUIRE(q.init(32, 64));
+  CHECK(q.add_request(1, 64, 0, 7, 0xFFFFFFFFu));
+  CHECK(q.waiting().front().start_frame == 7);
+  CHECK(q.waiting().front().number_of_packets == 0xFFFFFFFFu);
+}
+
+TEST_CASE("queue: pop_request fails requests in order, clear_waiting keeps packets") {
+  IntrInQueue q;
+  REQUIRE(q.init(32, 64));
+  q.add_request(1, 64, 0);
+  q.add_request(2, 64, 0);
+  push(q, 64, 1);
+  IntrRequest r;
+  CHECK(q.pop_request(&r));
+  CHECK(r.seqnum == 1);
+  q.clear_waiting();
+  CHECK(q.waiting().empty());
+  CHECK_FALSE(q.pop_request(&r));
+  CHECK(q.ring().size() == 1);  // packets stay until the next import
+}
+
+TEST_CASE("queue: request_active ignores the ring, should_prefetch reserves in-flight entries") {
+  IntrInQueue q;
+  REQUIRE(q.init(4, 64));
+  CHECK_FALSE(q.request_active(0));
+  q.add_request(1, 64, 100);
+  for (int i = 0; i < 4; ++i) push(q, 1, 0);
+  CHECK(q.request_active(100));  // ring full does not matter here
+  q.reset();
+  q.add_request(1, 64, 100);
+  push(q, 64, 0);
+  push(q, 64, 0);
+  CHECK(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, 1));        // 2 + 1 < 4
+  CHECK_FALSE(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, 2));  // 2 + 2 >= 4
+}

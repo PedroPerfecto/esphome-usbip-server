@@ -26,6 +26,12 @@ static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
 // A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
+// Interrupt OUT after CMD_UNLINK: RET_UNLINK at the latest after this long, then the slot is an orphan.
+static constexpr uint32_t OUT_UNLINK_WAIT_MS = 5000;
+// on_disconnected (main loop): bounded wait for the prefetch transfers to complete (NO_DEVICE) before
+// releasing the interfaces; far below the lock watchdog (10 s) and the task watchdog (5 s).
+static constexpr uint32_t DISCONNECT_PREFETCH_WAIT_MS = 500;
+static constexpr uint32_t DISCONNECT_PREFETCH_POLL_MS = 10;
 
 static const char *parse_error_str(usbip::ParseError e) {
   switch (e) {
@@ -104,10 +110,15 @@ const char *lock_diag_kind_str(uint8_t kind) {
 void USBIPServer::setup() {
   this->load_lock_diag_();
   if (this->max_pending_ > MAX_PENDING_LIMIT) this->max_pending_ = MAX_PENDING_LIMIT;
+  this->interrupt_queue_depth_ = std::min<uint16_t>(
+      std::max<uint16_t>(this->interrupt_queue_depth_, usbip::IntrRing::kMinDepth), usbip::IntrRing::kMaxDepth);
   this->dev_lock_ = xSemaphoreCreateMutex();
-  this->done_queue_ = xQueueCreate(this->max_pending_, sizeof(uint8_t));
+  // Room for every slot and every prefetch transfer: each posts at most one entry per submission.
+  this->done_queue_ = xQueueCreate(this->max_pending_ + PREFETCH_COUNT, sizeof(uint8_t));
   this->rx_payload_ = alloc_big_(this->max_transfer_size_);
-  if (this->dev_lock_ == nullptr || this->done_queue_ == nullptr || this->rx_payload_ == nullptr) {
+  this->intr_out_buf_ = alloc_big_(this->dma_chunk_size_);
+  if (this->dev_lock_ == nullptr || this->done_queue_ == nullptr || this->rx_payload_ == nullptr ||
+      this->intr_out_buf_ == nullptr) {
     ESP_LOGE(TAG, "Allocation failed");
     this->mark_failed();
     return;
@@ -115,6 +126,10 @@ void USBIPServer::setup() {
   for (uint8_t i = 0; i < MAX_PENDING_LIMIT; ++i) {
     this->slots_[i].owner = this;
     this->slots_[i].index = i;
+  }
+  for (uint8_t i = 0; i < PREFETCH_COUNT; ++i) {
+    this->prefetch_[i].owner = this;
+    this->prefetch_[i].index = static_cast<uint8_t>(MAX_PENDING_LIMIT + i);
   }
   std::fill(std::begin(this->diag_pub_), std::end(this->diag_pub_), UINT32_MAX);
   usb_host::USBClient::setup();
@@ -244,12 +259,22 @@ void USBIPServer::publish_diag_() {
       this->in_send_failed_.load(std::memory_order_relaxed),
       this->cb_queue_full_.load(std::memory_order_relaxed),
       this->dev_lock_hold_max_us_.exchange(0, std::memory_order_relaxed),  // peak since the last publish
+      this->intr_q_depth_max_.exchange(0, std::memory_order_relaxed),     // peak since the last publish
+      this->intr_q_full_.load(std::memory_order_relaxed),
+      this->intr_dropped_nosession_.load(std::memory_order_relaxed),
+      this->intr_flushed_import_.load(std::memory_order_relaxed),
+      this->intr_unlink_waiting_.load(std::memory_order_relaxed),
+      this->out_unlink_wait_timeout_.load(std::memory_order_relaxed),
+      this->intr_overflow_.load(std::memory_order_relaxed),
+      this->intr_zlp_dropped_.load(std::memory_order_relaxed),
   };
   static const char *const kNames[DIAG_COUNT] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
       "out_done_ok",  "unlink_rx",    "dropped_silent", "stale_skip", "send_errors",    "slot_exhausted",
       "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
       "dev_lock_hold_max_us",
+      "intr_q_depth_max", "intr_q_full", "intr_dropped_nosession", "intr_flushed_import", "intr_unlink_waiting",
+      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp_dropped",
   };
   bool any_changed = false;
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
@@ -257,7 +282,7 @@ void USBIPServer::publish_diag_() {
   }
   if (!any_changed) return;
 
-  char line[480];
+  char line[720];
   int off = 0;
   for (size_t i = 0; i < DIAG_COUNT && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
@@ -272,6 +297,9 @@ void USBIPServer::publish_diag_() {
       this->stale_skip_sensor_,   this->send_errors_sensor_,   this->slot_exhausted_sensor_,
       this->unlink_discarded_sensor_, this->in_resubmitted_sensor_, this->in_send_failed_sensor_,
       this->cb_queue_full_sensor_,     this->dev_lock_hold_max_sensor_,
+      this->intr_q_depth_max_sensor_,  this->intr_q_full_sensor_,  this->intr_dropped_nosession_sensor_,
+      this->intr_flushed_import_sensor_, this->intr_unlink_waiting_sensor_, this->out_unlink_wait_timeout_sensor_,
+      this->intr_overflow_sensor_,     this->intr_zlp_dropped_sensor_,
   };
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
@@ -317,9 +345,10 @@ void USBIPServer::dump_config() {
                 "  Bus ID: %s\n"
                 "  Max transfer size: %u\n"
                 "  DMA chunk size: %u\n"
-                "  Max pending: %u",
+                "  Max pending: %u\n"
+                "  Interrupt queue depth: %u",
                 this->port_, this->busid_.c_str(), (unsigned) this->max_transfer_size_,
-                (unsigned) this->dma_chunk_size_, this->max_pending_);
+                (unsigned) this->dma_chunk_size_, this->max_pending_, this->interrupt_queue_depth_);
   ESP_LOGCONFIG(TAG, "  TCP listening: %s", this->tcp_listening_.load() ? "YES" : "NO");
   usbip::DeviceInfo d;
   bool busy = false;
@@ -414,6 +443,7 @@ void USBIPServer::on_connected() {
   this->ep_count_ = ep_count;
   this->dev_ready_ = true;
   this->dev_ready_pub_.store(true, std::memory_order_relaxed);
+  this->dev_generation_.fetch_add(1, std::memory_order_relaxed);  // the TCP task sets up intr_in_ again
   xSemaphoreGive(this->dev_lock_);
 
   ESP_LOGI(TAG, "Exporting %04X:%04X as busid %s (%u interfaces claimed, %u endpoints, speed %u)", d.idVendor,
@@ -443,6 +473,20 @@ void USBIPServer::on_disconnected() {
   this->dev_ready_ = false;
   this->dev_ready_pub_.store(false, std::memory_order_relaxed);
   xSemaphoreGive(this->dev_lock_);
+  // usb_host_interface_release refuses an interface with transfers in flight (ESP_ERR_INVALID_STATE).
+  // The stack flushes the prefetch transfers of a gone device with NO_DEVICE (no halt wait, the port
+  // is invalid) and prefetch_cb_ runs in the USB task, so a short wait here is enough. No new prefetch
+  // can start: submit_locked_ checks dev_ready_ under dev_lock_.
+  for (uint32_t waited = 0; this->prefetch_in_flight_.load(std::memory_order_acquire) != 0 &&
+                            waited < DISCONNECT_PREFETCH_WAIT_MS;
+       waited += DISCONNECT_PREFETCH_POLL_MS) {
+    vTaskDelay(pdMS_TO_TICKS(DISCONNECT_PREFETCH_POLL_MS));
+  }
+  const uint32_t left = this->prefetch_in_flight_.load(std::memory_order_acquire);
+  if (left != 0) {
+    ESP_LOGW(TAG, "%u prefetch transfer(s) still in flight after %u ms, releasing interfaces anyway", (unsigned) left,
+             (unsigned) DISCONNECT_PREFETCH_WAIT_MS);
+  }
   this->release_interfaces_();
   ESP_LOGW(TAG, "USB device gone, nothing to export");
   usb_host::USBClient::on_disconnected();
@@ -483,6 +527,16 @@ void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   if (xQueueSend(slot->owner->done_queue_, &slot->index, 0) != pdTRUE) {
     slot->owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
   }
+}
+
+// USB task. Same as transfer_cb_, for the prefetch transfers of interrupt IN endpoints.
+void USBIPServer::prefetch_cb_(usb_transfer_t *xfer) {
+  auto *pf = static_cast<PrefetchXfer *>(xfer->context);
+  USBIPServer *s = pf->owner;
+  if (xQueueSend(s->done_queue_, &pf->index, 0) != pdTRUE) {
+    s->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
+  }
+  s->prefetch_in_flight_.fetch_sub(1, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------- TCP task
@@ -717,6 +771,7 @@ int USBIPServer::serve_client_(int sock, int listen_sock, const char *takeover_b
     } else {
       parser.set_imported();
       imported = true;
+      this->intr_on_import_();
       this->note_import_(sock);
       ESP_LOGI(TAG, "OP_REQ_IMPORT busid '%s' -> imported %04X:%04X (takeover)", takeover_busid, d.idVendor,
                d.idProduct);
@@ -729,6 +784,7 @@ int USBIPServer::serve_client_(int sock, int listen_sock, const char *takeover_b
       break;
     }
     if (!this->drain_completions_(sock)) break;
+    if (!this->intr_service_(sock)) break;
     if (imported && !this->device_ready_()) {
       ESP_LOGW(TAG, "USB device gone, closing USB/IP connection");
       break;
@@ -792,6 +848,7 @@ int USBIPServer::serve_client_(int sock, int listen_sock, const char *takeover_b
           }
           parser.set_imported();
           imported = true;
+          this->intr_on_import_();
           this->note_import_(sock);
           ESP_LOGI(TAG, "OP_REQ_IMPORT busid '%s' -> imported %04X:%04X", m.busid, d.idVendor, d.idProduct);
           break;
@@ -821,7 +878,8 @@ esp_err_t USBIPServer::submit_locked_(usb_transfer_t *x, bool is_control) {
   return is_control ? usb_host_transfer_submit_control(this->handle_, x) : usb_host_transfer_submit(x);
 }
 
-// Cancels all transfers on the endpoint (ESP-IDF cannot cancel a single transfer).
+// Cancels all transfers on the endpoint (ESP-IDF cannot cancel a single transfer). Bulk endpoints only:
+// halting a periodic (interrupt) pipe can wait forever in ESP-IDF 5.5.
 // Sequence halt -> flush -> clear follows usbipdcpp_esp32 (cancel_endpoint_all_transfers).
 void USBIPServer::cancel_endpoint_(uint8_t ep_addr) {
   DevLockHold hold(this, LockSite::CANCEL);
@@ -882,6 +940,9 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
              (unsigned) num_bytes, (unsigned) this->dma_chunk_size_);
     return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
   }
+  // Interrupt IN: answered from the prefetch ring, no USB transfer per request (no HALT on UNLINK).
+  if (e.type == usbip::kEpTypeInterrupt && dir_in) return this->handle_intr_in_submit_(sock, m, e);
+
   const bool zero_packet = (c.transfer_flags & usbip::kUrbZeroPacket) != 0;
   usbip::ChunkPlan plan(requested, this->dma_chunk_size_, e.mps, dir_in, zero_packet);
 
@@ -937,6 +998,7 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
   slot->requested = requested;
   slot->dir_in = dir_in;
   slot->is_control = false;
+  slot->is_intr = e.type == usbip::kEpTypeInterrupt;  // interrupt OUT (IN returned above)
   slot->ep_addr = addr;
   slot->chunked = chunked;
   slot->big_buf = big;
@@ -1016,9 +1078,19 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
     case usbip::ControlKind::kResetDevice:
       ESP_LOGW(TAG, "Port reset requested -> acknowledged without action");
       return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, 0, 0, nullptr);
-    case usbip::ControlKind::kClearHalt:
+    case usbip::ControlKind::kClearHalt: {
+      // Interrupt IN with prefetch: the host pipe is only halted after a STALL. Otherwise the request
+      // is answered here: forwarding it would reset the data toggle on the device but not on the host
+      // pipe (usb_host_endpoint_clear needs a halted pipe), and the next packet would be lost.
+      IntrInEp *iep = this->find_intr_in_(a.endpoint);
+      if (iep != nullptr && !iep->stalled) {
+        ESP_LOGD(TAG, "seq %u: CLEAR_FEATURE(HALT) ep %02X not stalled -> ok (not forwarded)", (unsigned) seq,
+                 a.endpoint);
+        return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, 0, 0, nullptr);
+      }
       clear_halt_ep = a.endpoint;  // forward to the device and on success reset the pipe on the host
       break;
+    }
     case usbip::ControlKind::kForward:
       break;
   }
@@ -1077,6 +1149,16 @@ bool USBIPServer::handle_unlink_(int sock, const usbip::Message &m) {
   // framing, which does not unambiguously cover this counter.
   this->unlink_rx_.fetch_add(1, std::memory_order_relaxed);
   const uint32_t target = m.unlink.unlink_seqnum;
+  // Interrupt IN request still waiting for data: no USB transfer belongs to it, just drop it. It is
+  // out of the FIFO now, so no RET_SUBMIT can follow this RET_UNLINK (Linux vhci_rx.c would drop the
+  // connection on a RET_SUBMIT for an unknown seqnum).
+  for (IntrInEp &ep : this->intr_in_) {
+    if (ep.active && ep.q.unlink(target)) {
+      this->intr_unlink_waiting_.fetch_add(1, std::memory_order_relaxed);
+      ESP_LOGV(TAG, "UNLINK seq %u (interrupt IN, waiting) -> RET_UNLINK", (unsigned) target);
+      return send_ret_unlink_(sock, m.unlink.base.seqnum, usbip::kLinuxECONNRESET);
+    }
+  }
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     PendingSlot &s = this->slots_[i];
     if (s.used && !s.orphan && s.seqnum == target) {
@@ -1086,8 +1168,13 @@ bool USBIPServer::handle_unlink_(int sock, const usbip::Message &m) {
         // A control transfer on ep0 cannot be cancelled in ESP-IDF (usbh_ep_get_handle does not
         // know ep0). Wait for completion and send RET_UNLINK instead of RET_SUBMIT.
         ESP_LOGV(TAG, "UNLINK seq %u (ep0) -> reply on completion", (unsigned) target);
+      } else if (s.is_intr) {
+        // Interrupt OUT: never halt a periodic pipe. Wait for the completion (RET_UNLINK then), at most
+        // OUT_UNLINK_WAIT_MS (intr_service_ answers and orphans the slot).
+        s.unlink_deadline_ms = now_ms_() + OUT_UNLINK_WAIT_MS;
+        ESP_LOGV(TAG, "UNLINK seq %u (interrupt OUT ep %02X) -> reply on completion", (unsigned) target, s.ep_addr);
       } else {
-        // Cancels all transfers on the endpoint; those without unlink_pending are resubmitted.
+        // Bulk: cancels all transfers on the endpoint; those without unlink_pending are resubmitted.
         ESP_LOGV(TAG, "UNLINK seq %u -> cancel ep %02X", (unsigned) target, s.ep_addr);
         this->cancel_endpoint_(s.ep_addr);
       }
@@ -1102,6 +1189,11 @@ bool USBIPServer::drain_completions_(int sock) {
   uint8_t idx;
   bool ok = true;
   while (xQueueReceive(this->done_queue_, &idx, 0) == pdTRUE) {
+    if (idx >= MAX_PENDING_LIMIT) {
+      // Prefetch transfer of an interrupt IN endpoint. After a failed send no more replies go out.
+      ok = this->handle_prefetch_done_(ok ? sock : -1, static_cast<uint8_t>(idx - MAX_PENDING_LIMIT)) && ok;
+      continue;
+    }
     PendingSlot &s = this->slots_[idx];
     usb_transfer_t *x = s.xfer;
     if (!s.used || x == nullptr) {
@@ -1114,7 +1206,8 @@ bool USBIPServer::drain_completions_(int sock) {
     }
 
     // Transfer cancelled only because of an UNLINK of another transfer on the same endpoint: resubmit.
-    if (x->status == USB_TRANSFER_STATUS_CANCELED && !s.is_control && !s.unlink_pending && !s.orphan) {
+    // (Bulk only: interrupt endpoints are never cancelled.)
+    if (x->status == USB_TRANSFER_STATUS_CANCELED && !s.is_control && !s.is_intr && !s.unlink_pending && !s.orphan) {
       // The cancelled completion is an IN completion with status != COMPLETED: counted here as
       // in_done_err because this branch `continue`s before the classification block below.
       if (s.dir_in) this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
@@ -1193,6 +1286,13 @@ bool USBIPServer::drain_completions_(int sock) {
       if (this->dev_ready_) {
         esp_err_t err = usb_host_endpoint_clear(this->device_handle_, s.clear_halt_ep);
         ESP_LOGD(TAG, "CLEAR_HALT ep %02X host side: %s", s.clear_halt_ep, esp_err_to_name(err));
+        IntrInEp *iep = this->find_intr_in_(s.clear_halt_ep);
+        if (iep != nullptr && err == ESP_OK) {
+          // The pipe is active again: resume the prefetch (intr_service_ submits it).
+          iep->stalled = false;
+          iep->need_clear = false;
+          ESP_LOGI(TAG, "Interrupt ep %02X: halt cleared, prefetch resumed", s.clear_halt_ep);
+        }
       }
     }
 
@@ -1237,6 +1337,12 @@ bool USBIPServer::drain_completions_(int sock) {
 
 void USBIPServer::end_session_() {
   this->client_addr_ = 0;
+  // Interrupt IN: waiting requests have nobody to answer to; the prefetch keeps no session state
+  // (completions are dropped and not resubmitted, see handle_prefetch_done_ / pump_prefetch_).
+  this->intr_session_ = false;
+  for (IntrInEp &ep : this->intr_in_) {
+    if (ep.active) ep.q.clear_waiting();
+  }
   uint8_t pending = 0;
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     if (this->slots_[i].used) {
@@ -1246,13 +1352,14 @@ void USBIPServer::end_session_() {
   }
   if (pending == 0) return;
 
-  // Interrupt IN waits for data forever - cancel pending transfers on all
-  // non-control endpoints so the slots are released (orphan -> no resubmission).
+  // Bulk IN may wait for data forever - cancel pending transfers on bulk endpoints so the slots are
+  // released (orphan -> no resubmission). Interrupt endpoints are never halted: interrupt OUT
+  // finishes by itself (or stays an orphan), interrupt IN has no slots.
   uint8_t cancelled[MAX_PENDING_LIMIT];
   uint8_t n_cancelled = 0;
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     const PendingSlot &s = this->slots_[i];
-    if (!s.used || s.is_control) continue;
+    if (!s.used || s.is_control || s.is_intr) continue;
     bool seen = false;
     for (uint8_t j = 0; j < n_cancelled; ++j) seen = seen || cancelled[j] == s.ep_addr;
     if (!seen) {
@@ -1273,6 +1380,341 @@ void USBIPServer::end_session_() {
   }
   // Unfinished slots stay occupied (orphan) and are released when they complete.
   ESP_LOGW(TAG, "%u transfer(s) still pending after session end", pending);
+}
+
+
+// ---------------------------------------------------------------- interrupt IN without HALT
+//
+// ESP-IDF 5.5 can wait forever in usb_host_endpoint_halt on a periodic pipe (_pipe_cmd_halt waits for
+// a HALT_REQ channel interrupt the DWC controller does not raise for periodic channels; esp-usb PR
+// #577). Interrupt IN endpoints therefore keep up to PREFETCH_PER_EP server-owned transfers of one
+// MPS each, store the packets in an IntrRing and answer the client's CMD_SUBMIT from it. CMD_UNLINK
+// only removes a waiting request (usbip_intrq.h). All of this runs in the TCP task.
+
+USBIPServer::IntrInEp *USBIPServer::find_intr_in_(uint8_t addr) {
+  for (IntrInEp &ep : this->intr_in_) {
+    if (ep.active && ep.addr == addr) return &ep;
+  }
+  return nullptr;
+}
+
+uint16_t USBIPServer::pf_in_flight_(const IntrInEp &ep) const {
+  uint16_t n = 0;
+  for (const PrefetchXfer *pf : ep.pf) {
+    if (pf != nullptr && pf->in_flight) ++n;
+  }
+  return n;
+}
+
+bool USBIPServer::setup_intr_eps_() {
+  usbip::EndpointInfo eps[usbip::kMaxEndpoints];
+  size_t n = 0;
+  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+  const bool ready = this->dev_ready_;
+  const uint32_t gen = this->dev_generation_.load(std::memory_order_relaxed);
+  if (ready) {
+    n = this->ep_count_;
+    for (size_t i = 0; i < n; ++i) eps[i] = this->eps_[i];
+  }
+  xSemaphoreGive(this->dev_lock_);
+  if (!ready) return false;
+  if (this->intr_configured_ && gen == this->intr_generation_) return true;
+
+  // Transfers of the previous device can only be freed after their completion was drained
+  // (NO_DEVICE). Normally done by drain_completions_ before this call; otherwise retry later.
+  for (const PrefetchXfer &pf : this->prefetch_) {
+    if (pf.in_flight) {
+      ESP_LOGW(TAG, "Prefetch transfer of the previous device still in flight, interrupt setup postponed");
+      this->intr_configured_ = false;
+      return false;
+    }
+  }
+  for (PrefetchXfer &pf : this->prefetch_) {
+    if (pf.xfer != nullptr) usb_host_transfer_free(pf.xfer);
+    pf.xfer = nullptr;
+    pf.ep = nullptr;
+  }
+  for (IntrInEp &ep : this->intr_in_) {
+    ep.active = false;
+    ep.stalled = false;
+    ep.need_clear = false;
+    ep.blocked_full = false;
+    for (PrefetchXfer *&p : ep.pf) p = nullptr;
+  }
+
+  uint8_t used = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const usbip::EndpointInfo &e = eps[i];
+    if (e.type != usbip::kEpTypeInterrupt || (e.address & 0x80) == 0 || e.mps == 0) continue;
+    if (used >= MAX_INTR_IN_EPS) {
+      ESP_LOGW(TAG, "Interrupt IN ep %02X: more than %u interrupt IN endpoints, not served", e.address,
+               MAX_INTR_IN_EPS);
+      continue;
+    }
+    IntrInEp &ep = this->intr_in_[used];
+    if (!ep.q.init(this->interrupt_queue_depth_, e.mps)) {
+      ESP_LOGE(TAG, "Interrupt IN ep %02X: queue allocation failed, not served", e.address);
+      continue;
+    }
+    ep.q.reset();
+    bool alloc_ok = true;
+    for (uint8_t k = 0; k < PREFETCH_PER_EP; ++k) {
+      PrefetchXfer &pf = this->prefetch_[used * PREFETCH_PER_EP + k];
+      usb_transfer_t *x = nullptr;
+      if (usb_host_transfer_alloc(e.mps, 0, &x) != ESP_OK || x == nullptr) {
+        alloc_ok = false;
+        break;
+      }
+      x->bEndpointAddress = e.address;
+      x->num_bytes = e.mps;
+      x->flags = 0;
+      x->callback = prefetch_cb_;
+      x->context = &pf;
+      pf.xfer = x;
+      pf.ep = &ep;
+      pf.in_flight = false;
+      ep.pf[k] = &pf;
+    }
+    if (!alloc_ok) {
+      for (PrefetchXfer *&p : ep.pf) {
+        if (p != nullptr && p->xfer != nullptr) usb_host_transfer_free(p->xfer);
+        if (p != nullptr) {
+          p->xfer = nullptr;
+          p->ep = nullptr;
+        }
+        p = nullptr;
+      }
+      ESP_LOGE(TAG, "Interrupt IN ep %02X: transfer allocation failed, not served", e.address);
+      continue;
+    }
+    ep.addr = e.address;
+    ep.mps = e.mps;
+    ep.active = true;
+    ++used;
+    ESP_LOGI(TAG, "Interrupt IN ep %02X: prefetch without HALT (%u transfers, queue %u x %u B)", e.address,
+             PREFETCH_PER_EP, ep.q.ring().depth(), e.mps);
+  }
+  this->intr_generation_ = gen;
+  this->intr_configured_ = true;
+  return true;
+}
+
+void USBIPServer::intr_on_import_() {
+  this->intr_session_ = false;
+  this->drain_completions_(-1);  // completions from before this import (counted as no-session drops)
+  this->setup_intr_eps_();
+  uint32_t flushed = 0;
+  for (IntrInEp &ep : this->intr_in_) {
+    if (!ep.active) continue;
+    flushed += ep.q.ring().size();
+    ep.q.reset();
+    ep.blocked_full = false;
+  }
+  if (flushed > 0) {
+    this->intr_flushed_import_.fetch_add(flushed, std::memory_order_relaxed);
+    ESP_LOGD(TAG, "Import: %u stored interrupt packet(s) dropped", (unsigned) flushed);
+  }
+  this->intr_session_ = true;
+}
+
+bool USBIPServer::handle_intr_in_submit_(int sock, const usbip::Message &m, const usbip::EndpointInfo &e) {
+  const usbip::CmdSubmit &c = m.submit;
+  const uint32_t seq = c.base.seqnum;
+  IntrInEp *ep = this->find_intr_in_(e.address);
+  if (ep == nullptr) {
+    ESP_LOGW(TAG, "seq %u: interrupt IN ep %02X has no prefetch -> -EPIPE", (unsigned) seq, e.address);
+    return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+  if (ep->stalled) {
+    // As on a real host: transfers to a halted endpoint fail until CLEAR_FEATURE(HALT).
+    ESP_LOGV(TAG, "seq %u: interrupt ep %02X stalled -> -EPIPE", (unsigned) seq, e.address);
+    return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+  const uint32_t now = now_ms_();
+  if (!ep->q.add_request(seq, c.transfer_buffer_length, now, c.start_frame, c.number_of_packets)) {
+    this->slot_exhausted_.fetch_add(1, std::memory_order_relaxed);
+    ESP_LOGW(TAG, "seq %u: too many waiting interrupt IN requests -> -EPIPE", (unsigned) seq);
+    return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+  ESP_LOGV(TAG, "seq %u: INTR IN ep %02X len %u (queued %u)", (unsigned) seq, e.address,
+           (unsigned) c.transfer_buffer_length, (unsigned) ep->q.ring().size());
+  const bool ok = this->serve_intr_ep_(sock, *ep);  // from the ring at once, if it holds the data
+  this->pump_prefetch_(*ep, now);                   // otherwise make sure the prefetch is running
+  return ok;
+}
+
+bool USBIPServer::serve_intr_ep_(int sock, IntrInEp &ep) {
+  bool ok = true;
+  uint32_t seq = 0;
+  usbip::IntrServePlan plan;
+  while (ok && sock >= 0 && ep.q.front_ready(&seq, &plan)) {
+    const usbip::IntrRequest r = ep.q.waiting().front();
+    ep.q.complete_front(plan, this->intr_out_buf_);  // plan.length <= request length <= dma_chunk_size_
+    int32_t status = 0;
+    if (plan.overflow) {
+      // The packet was longer than the request: a Linux HCD reports babble as -EOVERFLOW.
+      status = usbip::kLinuxEOVERFLOW;
+      this->intr_overflow_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ok = send_ret_submit_(sock, seq, r.start_frame, r.number_of_packets, status, plan.length, this->intr_out_buf_);
+    if (plan.length > 0) {
+      if (ok) {
+        this->in_ret_sent_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        this->in_send_failed_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (!ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
+    ESP_LOGV(TAG, "seq %u: INTR IN ep %02X done, status %d, %u B (%u packet(s))", (unsigned) seq, ep.addr,
+             (int) status, (unsigned) plan.length, plan.packets);
+  }
+  return ok;
+}
+
+bool USBIPServer::fail_waiting_(int sock, IntrInEp &ep, int32_t status) {
+  bool ok = true;
+  usbip::IntrRequest r;
+  while (ep.q.pop_request(&r)) {
+    if (ok && sock >= 0) {
+      ok = send_ret_submit_(sock, r.seqnum, r.start_frame, r.number_of_packets, status, 0, nullptr);
+      if (!ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  return ok;
+}
+
+void USBIPServer::pump_prefetch_(IntrInEp &ep, uint32_t now) {
+  if (!ep.active || !this->intr_session_ || ep.stalled) return;
+  if (ep.need_clear) {
+    // A transfer error halted the pipe (the stack flushed the other transfer). Clear it on the host
+    // once every completion is drained; the device is not halted, so nothing goes to the device.
+    if (this->pf_in_flight_(ep) != 0) return;
+    esp_err_t err;
+    {
+      DevLockHold hold(this, LockSite::CLEAR);
+      err = this->dev_ready_ ? usb_host_endpoint_clear(this->device_handle_, ep.addr) : ESP_ERR_INVALID_STATE;
+    }
+    ep.need_clear = false;
+    if (err != ESP_OK) {
+      // Not seen so far; stop the prefetch until the client clears the halt (CLEAR_FEATURE is forwarded).
+      ep.stalled = true;
+      ESP_LOGW(TAG, "Interrupt ep %02X: clear after transfer error failed: %s, prefetch stopped", ep.addr,
+               esp_err_to_name(err));
+      return;
+    }
+  }
+  for (PrefetchXfer *pf : ep.pf) {
+    if (pf == nullptr || pf->xfer == nullptr || pf->in_flight) continue;
+    // Every transfer in flight may still bring a packet: count them as taken ring entries.
+    if (!ep.q.should_prefetch(true, now, usbip::kDefaultPrefetchWindowMs, this->pf_in_flight_(ep))) break;
+    usb_transfer_t *x = pf->xfer;
+    x->num_bytes = ep.mps;
+    x->flags = 0;
+    pf->in_flight = true;
+    this->prefetch_in_flight_.fetch_add(1, std::memory_order_relaxed);  // before the submit: the callback decrements
+    const esp_err_t err = this->submit_locked_(x, false);
+    if (err != ESP_OK) {
+      pf->in_flight = false;
+      this->prefetch_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+      ESP_LOGV(TAG, "Interrupt ep %02X: prefetch submit failed: %s", ep.addr, esp_err_to_name(err));
+      break;
+    }
+    this->in_submitted_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // intr_q_full: counted once each time the ring starts holding the prefetch back.
+  const bool full = static_cast<uint32_t>(ep.q.ring().size()) + this->pf_in_flight_(ep) >= ep.q.ring().depth();
+  const bool blocked = full && ep.q.request_active(now, usbip::kDefaultPrefetchWindowMs);
+  if (blocked && !ep.blocked_full) this->intr_q_full_.fetch_add(1, std::memory_order_relaxed);
+  ep.blocked_full = blocked;
+}
+
+bool USBIPServer::handle_prefetch_done_(int sock, uint8_t pf_index) {
+  if (pf_index >= PREFETCH_COUNT) {
+    this->stale_skip_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  PrefetchXfer &pf = this->prefetch_[pf_index];
+  if (!pf.in_flight || pf.xfer == nullptr || pf.ep == nullptr) {
+    this->stale_skip_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  pf.in_flight = false;
+  IntrInEp &ep = *pf.ep;
+  const usb_transfer_t *x = pf.xfer;
+  bool ok = true;
+  switch (x->status) {
+    case USB_TRANSFER_STATUS_COMPLETED:
+      if (x->actual_num_bytes > 0) {
+        this->in_done_data_.fetch_add(1, std::memory_order_relaxed);
+        const uint16_t len = static_cast<uint16_t>(std::min<int>(x->actual_num_bytes, ep.mps));
+        if (!this->intr_session_) {
+          this->intr_dropped_nosession_.fetch_add(1, std::memory_order_relaxed);
+        } else if (!ep.q.on_packet(x->data_buffer, len)) {
+          // Should not happen: pump_prefetch_ reserves a ring entry for every transfer in flight.
+          this->intr_q_full_.fetch_add(1, std::memory_order_relaxed);
+          ESP_LOGW(TAG, "Interrupt ep %02X: ring full, packet dropped", ep.addr);
+        }
+      } else {
+        // 0 B completion: not stored (not established that it is always a real zero-length packet).
+        this->in_done_empty_.fetch_add(1, std::memory_order_relaxed);
+        this->intr_zlp_dropped_.fetch_add(1, std::memory_order_relaxed);
+      }
+      break;
+    case USB_TRANSFER_STATUS_STALL:
+      // The device halted the endpoint; the stack halted and flushed the pipe. Waiting requests fail
+      // with -EPIPE (the client then sends CLEAR_FEATURE(HALT), which is forwarded).
+      this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
+      if (!ep.stalled) ESP_LOGW(TAG, "Interrupt ep %02X: STALL, prefetch paused until CLEAR_FEATURE(HALT)", ep.addr);
+      ep.stalled = true;
+      ok = this->fail_waiting_(sock, ep, usbip::kLinuxEPIPE);
+      break;
+    case USB_TRANSFER_STATUS_NO_DEVICE:
+    case USB_TRANSFER_STATUS_CANCELED:  // flushed together with a STALL/error of the other transfer
+      this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    default:
+      // ERROR / TIMED_OUT / OVERFLOW: the stack halted and flushed the pipe, the device did not.
+      // The packet is lost; the pipe is cleared on the host and the prefetch continues.
+      this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
+      if (!ep.stalled) ep.need_clear = true;
+      ESP_LOGW(TAG, "Interrupt ep %02X: prefetch transfer status %d, clearing the pipe", ep.addr, (int) x->status);
+      break;
+  }
+  if (ok && sock >= 0 && this->intr_session_) ok = this->serve_intr_ep_(sock, ep);
+  this->pump_prefetch_(ep, now_ms_());
+  return ok;
+}
+
+bool USBIPServer::intr_service_(int sock) {
+  const uint32_t now = now_ms_();
+  if (this->intr_session_ && !this->intr_configured_) this->setup_intr_eps_();  // postponed at import
+  uint32_t peak = 0;
+  for (IntrInEp &ep : this->intr_in_) {
+    if (!ep.active) continue;
+    this->pump_prefetch_(ep, now);  // also re-evaluates the 50 ms window
+    peak = std::max<uint32_t>(peak, ep.q.ring().size());
+  }
+  uint32_t cur = this->intr_q_depth_max_.load(std::memory_order_relaxed);
+  while (peak > cur && !this->intr_q_depth_max_.compare_exchange_weak(cur, peak, std::memory_order_relaxed)) {
+  }
+
+  // Interrupt OUT after CMD_UNLINK: RET_UNLINK at the latest OUT_UNLINK_WAIT_MS later. The slot stays
+  // an orphan, so its later completion sends nothing (no RET_SUBMIT after RET_UNLINK).
+  bool ok = true;
+  for (uint8_t i = 0; i < this->max_pending_; ++i) {
+    PendingSlot &s = this->slots_[i];
+    if (!s.used || !s.is_intr || !s.unlink_pending || s.orphan) continue;
+    if (static_cast<int32_t>(now - s.unlink_deadline_ms) < 0) continue;
+    this->out_unlink_wait_timeout_.fetch_add(1, std::memory_order_relaxed);
+    ESP_LOGW(TAG, "seq %u: interrupt OUT ep %02X not finished %u ms after UNLINK -> RET_UNLINK, orphaned",
+             (unsigned) s.seqnum, s.ep_addr, (unsigned) OUT_UNLINK_WAIT_MS);
+    if (ok && sock >= 0) {
+      ok = send_ret_unlink_(sock, s.unlink_seqnum, usbip::kLinuxECONNRESET);
+      if (!ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
+    }
+    s.orphan = true;
+  }
+  return ok;
 }
 
 }  // namespace esphome::usbip_server
