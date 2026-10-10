@@ -39,8 +39,9 @@ CONFIG_SCHEMA = cv.COMPONENT_SCHEMA.extend(
         # largest single USB transfer in internal RAM (DMA); larger bulk transfers are split
         cv.Optional(CONF_DMA_CHUNK_SIZE, default=16384): cv.int_range(min=64, max=65536),
         cv.Optional(CONF_MAX_PENDING, default=16): cv.int_range(min=1, max=32),
-        # packets stored per interrupt IN endpoint (prefetch without HALT); one entry = one packet <= MPS
-        cv.Optional(CONF_INTERRUPT_QUEUE_DEPTH, default=32): cv.int_range(min=4, max=256),
+        # packets stored per interrupt IN endpoint (prefetch without HALT); one entry = one packet <= MPS,
+        # storage in PSRAM (depth * MPS bytes)
+        cv.Optional(CONF_INTERRUPT_QUEUE_DEPTH, default=32): cv.int_range(min=4, max=4096),
         # exported interface numbers (bInterfaceNumber); omitted = all
         cv.Optional(CONF_INTERFACES): cv.All(
             cv.ensure_list(cv.int_range(min=0, max=31)), cv.Length(min=1)

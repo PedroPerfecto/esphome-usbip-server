@@ -1431,6 +1431,16 @@ void USBIPServer::end_session_() {
 // MPS each, store the packets in an IntrRing and answer the client's CMD_SUBMIT from it. CMD_UNLINK
 // only removes a waiting request (usbip_intrq.h). All of this runs in the TCP task.
 
+// Ring storage for interrupt IN queues: PSRAM (up to 4096 x MPS bytes per endpoint does not fit the
+// internal heap; CONFIG_SPIRAM_USE_MALLOC is off, so plain new/malloc never use PSRAM). Falls back to
+// internal RAM without PSRAM.
+static void *intr_ring_alloc(size_t size) {
+  void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (p == nullptr) p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  return p;
+}
+static void intr_ring_free(void *ptr) { heap_caps_free(ptr); }
+
 USBIPServer::IntrInEp *USBIPServer::find_intr_in_(uint8_t addr) {
   for (IntrInEp &ep : this->intr_in_) {
     if (ep.active && ep.addr == addr) return &ep;
@@ -1502,7 +1512,7 @@ bool USBIPServer::setup_intr_eps_() {
       continue;
     }
     IntrInEp &ep = this->intr_in_[used];
-    if (!ep.q.init(this->interrupt_queue_depth_, e.mps)) {
+    if (!ep.q.init(this->interrupt_queue_depth_, e.mps, usbip::IntrAllocator{intr_ring_alloc, intr_ring_free})) {
       ESP_LOGE(TAG, "Interrupt IN ep %02X: queue allocation failed, not served", e.address);
       continue;
     }
@@ -1543,6 +1553,12 @@ bool USBIPServer::setup_intr_eps_() {
     ++used;
     ESP_LOGI(TAG, "Interrupt IN ep %02X: prefetch without HALT (%u transfers, queue %u x %u B)", e.address,
              PREFETCH_PER_EP, ep.q.ring().depth(), e.mps);
+  }
+  if (used > 0) {
+    ESP_LOGI(TAG, "Free heap after interrupt setup: internal %u B (largest block %u B), PSRAM %u B",
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   }
   this->intr_generation_ = gen;
   this->intr_configured_ = true;

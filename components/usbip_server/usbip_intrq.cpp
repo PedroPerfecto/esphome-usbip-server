@@ -7,19 +7,39 @@ namespace usbip {
 
 // ---------------------------------------------------------------- IntrRing
 
-bool IntrRing::init(uint16_t depth, uint16_t mps) {
-  this->data_.reset();
-  this->lens_.reset();
+void *IntrRing::alloc_(size_t size) {
+  if (this->allocator_.alloc != nullptr) return this->allocator_.alloc(size);
+  return new (std::nothrow) uint8_t[size];
+}
+
+void IntrRing::free_(void *ptr) {
+  if (ptr == nullptr) return;
+  if (this->allocator_.free != nullptr) {
+    this->allocator_.free(ptr);
+  } else {
+    delete[] static_cast<uint8_t *>(ptr);
+  }
+}
+
+void IntrRing::release_() {
+  this->free_(this->data_);
+  this->free_(this->lens_);
+  this->data_ = nullptr;
+  this->lens_ = nullptr;
   this->depth_ = 0;
   this->mps_ = 0;
   this->clear();
+}
+
+bool IntrRing::init(uint16_t depth, uint16_t mps, IntrAllocator allocator) {
+  this->release_();
+  this->allocator_ = (allocator.alloc != nullptr && allocator.free != nullptr) ? allocator : IntrAllocator{};
   if (mps == 0) return false;
   depth = std::min<uint16_t>(std::max<uint16_t>(depth, kMinDepth), kMaxDepth);
-  this->data_.reset(new (std::nothrow) uint8_t[static_cast<size_t>(depth) * mps]);
-  this->lens_.reset(new (std::nothrow) uint16_t[depth]);
+  this->data_ = static_cast<uint8_t *>(this->alloc_(static_cast<size_t>(depth) * mps));
+  this->lens_ = static_cast<uint16_t *>(this->alloc_(static_cast<size_t>(depth) * sizeof(uint16_t)));
   if (this->data_ == nullptr || this->lens_ == nullptr) {
-    this->data_.reset();
-    this->lens_.reset();
+    this->release_();
     return false;
   }
   this->depth_ = depth;
@@ -30,7 +50,7 @@ bool IntrRing::init(uint16_t depth, uint16_t mps) {
 bool IntrRing::push(const uint8_t *data, uint16_t len) {
   if (this->data_ == nullptr || this->full() || len > this->mps_) return false;
   const uint16_t s = this->slot_(this->count_);
-  if (len > 0) memcpy(this->data_.get() + static_cast<size_t>(s) * this->mps_, data, len);
+  if (len > 0) memcpy(this->data_ + static_cast<size_t>(s) * this->mps_, data, len);
   this->lens_[s] = len;
   ++this->count_;
   if (this->count_ > this->peak_) this->peak_ = this->count_;
@@ -47,7 +67,7 @@ bool IntrRing::pop() {
 uint16_t IntrRing::len_at(uint16_t i) const { return this->lens_[this->slot_(i)]; }
 
 const uint8_t *IntrRing::data_at(uint16_t i) const {
-  return this->data_.get() + static_cast<size_t>(this->slot_(i)) * this->mps_;
+  return this->data_ + static_cast<size_t>(this->slot_(i)) * this->mps_;
 }
 
 void IntrRing::clear() {

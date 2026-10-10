@@ -48,14 +48,14 @@ TEST_CASE("ring: packet larger than MPS is refused, zero-length packet is stored
   CHECK(r.len_at(0) == 0);
 }
 
-TEST_CASE("ring: depth is clamped to 4..256, boundary depths work") {
+TEST_CASE("ring: depth is clamped to 4..4096, boundary depths work") {
   IntrRing r;
   REQUIRE(r.init(1, 64));
   CHECK(r.depth() == 4);
-  REQUIRE(r.init(1000, 64));
-  CHECK(r.depth() == 256);
+  REQUIRE(r.init(5000, 64));
+  CHECK(r.depth() == 4096);
 
-  for (uint16_t depth : {uint16_t{4}, uint16_t{256}}) {
+  for (uint16_t depth : {uint16_t{4}, uint16_t{256}, uint16_t{4096}}) {
     CAPTURE(depth);
     REQUIRE(r.init(depth, 64));
     CHECK(r.depth() == depth);
@@ -425,4 +425,35 @@ TEST_CASE("queue: request_active ignores the ring, should_prefetch reserves in-f
   push(q, 64, 0);
   CHECK(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, 1));        // 2 + 1 < 4
   CHECK_FALSE(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, 2));  // 2 + 2 >= 4
+}
+
+TEST_CASE("ring: custom allocator is used for both buffers and released on re-init") {
+  static int allocs = 0, frees = 0;
+  static size_t bytes = 0;
+  allocs = frees = 0;
+  bytes = 0;
+  IntrAllocator a{[](size_t n) -> void * { ++allocs; bytes += n; return ::operator new(n); },
+                  [](void *p) { ++frees; ::operator delete(p); }};
+  {
+    IntrRing r;
+    REQUIRE(r.init(4096, 64, a));
+    CHECK(allocs == 2);
+    CHECK(bytes == 4096u * 64u + 4096u * sizeof(uint16_t));
+    for (int i = 0; i < 4096; ++i) CHECK(push(r, 64, static_cast<uint8_t>(i)));
+    CHECK(r.full());
+    REQUIRE(r.init(32, 64, a));  // re-init frees the previous storage
+    CHECK(frees == 2);
+    CHECK(allocs == 4);
+  }
+  CHECK(frees == 4);  // destructor
+}
+
+TEST_CASE("ring: failing allocator -> init false, nothing leaks") {
+  static int frees = 0;
+  frees = 0;
+  IntrAllocator a{[](size_t) -> void * { return nullptr; }, [](void *p) { if (p) ++frees; }};
+  IntrRing r;
+  CHECK_FALSE(r.init(4096, 64, a));
+  CHECK_FALSE(r.initialized());
+  CHECK(frees == 0);
 }

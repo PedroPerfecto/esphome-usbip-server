@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 
 // Interrupt IN endpoints without HALT (no ESPHome/ESP-IDF dependencies).
 //
@@ -12,17 +11,30 @@
 // then only removes a request from IntrWaitFifo and never touches the USB pipe.
 namespace usbip {
 
+// Storage allocator for IntrRing (the server passes one that uses PSRAM; the default uses new/delete).
+struct IntrAllocator {
+  void *(*alloc)(size_t size){nullptr};
+  void (*free)(void *ptr){nullptr};
+};
+
 // Ring of received packets of one interrupt IN endpoint. Each entry is one USB packet (0..MPS
 // bytes; a zero-length packet is stored as an entry of length 0). Storage is allocated once in
 // init(): depth * MPS bytes of data plus one length per entry.
 class IntrRing {
  public:
   static constexpr uint16_t kMinDepth = 4;
-  static constexpr uint16_t kMaxDepth = 256;
+  static constexpr uint16_t kMaxDepth = 4096;
   static constexpr uint16_t kDefaultDepth = 32;
 
+  IntrRing() = default;
+  ~IntrRing() { this->release_(); }
+  IntrRing(const IntrRing &) = delete;
+  IntrRing &operator=(const IntrRing &) = delete;
+
   // depth is clamped to [kMinDepth, kMaxDepth]. Returns false on allocation failure or mps == 0.
-  bool init(uint16_t depth, uint16_t mps);
+  // allocator: where the storage (depth * MPS data bytes + depth lengths) goes; both functions
+  // null = new/delete. Kept until the next init() or destruction.
+  bool init(uint16_t depth, uint16_t mps, IntrAllocator allocator = {});
   bool initialized() const { return data_ != nullptr; }
 
   // Appends a copy of one packet. Fails (returns false, ring unchanged) if full or len > MPS.
@@ -48,8 +60,13 @@ class IntrRing {
  private:
   uint16_t slot_(uint16_t i) const { return static_cast<uint16_t>((head_ + i) % depth_); }
 
-  std::unique_ptr<uint8_t[]> data_;
-  std::unique_ptr<uint16_t[]> lens_;
+  void release_();
+  void *alloc_(size_t size);
+  void free_(void *ptr);
+
+  IntrAllocator allocator_{};
+  uint8_t *data_{nullptr};
+  uint16_t *lens_{nullptr};
   uint16_t depth_{0};
   uint16_t mps_{0};
   uint16_t head_{0};
@@ -128,7 +145,9 @@ bool prefetch_allowed(bool session_active, bool ring_full, bool request_waiting,
 // One interrupt IN endpoint: ring + waiting requests + time of the last request.
 class IntrInQueue {
  public:
-  bool init(uint16_t depth, uint16_t mps) { return this->ring_.init(depth, mps); }
+  bool init(uint16_t depth, uint16_t mps, IntrAllocator allocator = {}) {
+    return this->ring_.init(depth, mps, allocator);
+  }
 
   // CMD_SUBMIT IN. Returns false if the FIFO is full (request not stored).
   bool add_request(uint32_t seqnum, uint32_t length, uint32_t now_ms, uint32_t start_frame = 0,
