@@ -2,38 +2,40 @@
 #include <cstddef>
 #include <cstdint>
 
-// Detection of interrupt OUT transfers the USB stack never completes (no ESPHome/ESP-IDF
-// dependencies). Such a transfer keeps its slot for good (a periodic pipe is never halted, see
-// usbip_intrq.h); once all slots are taken every later transfer is refused. The server cannot
-// recover the pipe, so it leaves a record and restarts.
+// Detection of transfers the USB stack never completes (no ESPHome/ESP-IDF dependencies). Such a
+// transfer keeps its slot for good: an interrupt OUT cannot be cancelled (a periodic pipe is never
+// halted, see usbip_intrq.h), a control transfer cannot be cancelled at all, and a bulk transfer
+// may survive its cancel. Once all slots are taken every later transfer is refused. The server
+// cannot recover the pipe, so it leaves a record and restarts.
 namespace usbip {
 
-static constexpr uint32_t kOutStuckAgeMs = 3000;     // in flight this long without a completion
-static constexpr uint32_t kOutOrphanGraceMs = 1000;  // orphaned slot still in flight this long
+static constexpr uint32_t kOutStuckTimeoutMs = 3000;  // default limit (YAML: out_stuck_timeout)
 
 enum class OutStuck : uint8_t {
   kNone = 0,
-  kAge = 1,     // the oldest transfer in flight is older than kOutStuckAgeMs
-  kOrphan = 2,  // an orphaned slot (answered with RET_UNLINK / session ended) is still in flight
+  kAge = 1,     // interrupt OUT in flight longer than the limit
+  kOrphan = 2,  // orphaned slot (answered with RET_UNLINK / session ended) still in flight after the limit
 };
 
-// Snapshot of the interrupt OUT transfers. Times in ms, unsigned 32-bit (differences stay valid
-// across a wrap).
-struct OutWatch {
-  uint32_t in_flight{0};         // submitted, completion callback not run yet (USB stack view)
-  bool have_oldest{false};       // a submitted transfer has not been released yet
-  uint32_t oldest_submit_ms{0};  // when the oldest of them was submitted
-  uint8_t oldest_ep{0};
-  bool have_orphan{false};       // an orphaned slot has not been released yet
-  uint32_t orphan_since_ms{0};   // when the oldest of them was orphaned
-  uint8_t orphan_ep{0};
+// One slot as the detector sees it. Times in ms, unsigned 32-bit (differences stay valid across a wrap).
+struct WatchedXfer {
+  bool in_flight{false};  // submitted, completion callback not run yet (USB stack view)
+  bool intr_out{false};   // interrupt OUT: completes within milliseconds on a healthy device
+  bool orphan{false};     // the client was told it is over (RET_UNLINK after the wait) or is gone
+  // Start of the time that is judged. Interrupt OUT: its submission, so an orphan of that kind is
+  // measured by the age of the transfer. Control and bulk may legitimately be in flight for long
+  // (bulk IN waits for data), so for them it is the moment the transfer was asked to end: CMD_UNLINK
+  // received, or the session ended.
+  uint32_t since_ms{0};
+  uint8_t ep{0};          // endpoint address, 0 = control (ep0)
 };
 
-// in_flight == 0 means every callback has run (slots only wait to be released): never stuck.
-// The orphan rule has a short grace so that a transfer completing right after the session ended
-// is not reported. kAge wins if both apply.
-OutStuck out_stuck_check(const OutWatch &w, uint32_t now_ms, uint32_t max_age_ms = kOutStuckAgeMs,
-                         uint32_t orphan_grace_ms = kOutOrphanGraceMs);
+// Interrupt OUT: stuck once in flight longer than timeout_ms (kOrphan if it is an orphan by then,
+// else kAge). Control and bulk: only as orphans, and only once since_ms is more than timeout_ms ago.
+// Not in flight (the callback has run, the slot only waits to be released) is never stuck.
+OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms = kOutStuckTimeoutMs);
+// The transfer stuck for the longest time among items[0..count); kNone if there is none.
+OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms, uint32_t timeout_ms, size_t *index);
 
 // Result of the control transfer (GET_STATUS) sent to ep0 when a stuck transfer is detected.
 enum class Ep0Probe : uint8_t {
@@ -41,6 +43,7 @@ enum class Ep0Probe : uint8_t {
   kOk = 1,       // completed successfully within the limit
   kError = 2,    // completed with an error status within the limit
   kTimeout = 3,  // no completion within the limit
+  kSkipped = 4,  // not tried: the stuck transfer is the one on ep0, or no reboot follows
 };
 const char *ep0_probe_str(Ep0Probe r);
 

@@ -113,9 +113,7 @@ class USBIPServer : public usb_host::USBClient {
     bool dir_in{false};
     bool is_control{false};
     bool is_intr{false};         // interrupt endpoint (only OUT uses slots, IN is served by IntrInEp)
-    uint32_t unlink_deadline_ms{0};  // interrupt OUT with unlink_pending: RET_UNLINK at the latest then
-    uint32_t submit_ms{0};       // interrupt OUT: when it was submitted (out-stuck detector)
-    uint32_t orphan_ms{0};       // interrupt OUT: when it became an orphan (out-stuck detector)
+    uint32_t unlink_deadline_ms{0};  // unlink_pending: RET_UNLINK at the latest then (the slot becomes an orphan)
     bool orphan{false};          // connection ended, just release
     bool unlink_pending{false};  // client sent CMD_UNLINK, reply with RET_UNLINK
     bool chunked{false};         // large bulk transfer split into chunks
@@ -153,6 +151,8 @@ class USBIPServer : public usb_host::USBClient {
   // Submits the waiting bulk transfers whose endpoint got free (bulk_order_), oldest first.
   bool pump_bulk_(int sock);
   esp_err_t submit_locked_(usb_transfer_t *x, bool is_control);  // submits under dev_lock_
+  // Submits the transfer of a slot and keeps slots_in_flight_ (stuck detector) in step.
+  esp_err_t submit_slot_(PendingSlot &slot);
   void cancel_endpoint_(uint8_t ep_addr);                        // halt + flush + clear
   void note_request_size_(uint32_t size);
   static uint8_t *alloc_big_(size_t size);  // PSRAM if available
@@ -212,10 +212,12 @@ class USBIPServer : public usb_host::USBClient {
   void publish_diag_();          // main loop: diag counters to log/entities, only on change
   void check_lock_watchdog_();   // main loop: reboot if dev_lock_ stays held in a usb_host_* section
   void check_intr_setup_stuck_();  // main loop: reboot if the interrupt setup stays postponed
-  // Interrupt OUT that never completes (usbip_outwatch.h). The TCP task keeps the oldest submit /
-  // orphan time in atomics (update_out_watch_, after every change of an interrupt OUT slot); the
-  // main loop judges them every 1 s, probes ep0, leaves a record and reboots (check_out_stuck_).
-  void update_out_watch_();
+  // Transfers that never complete (usbip_outwatch.h). The TCP task publishes what the detector needs
+  // about every slot in atomics (watch_*, slots_in_flight_); the main loop judges them every 1 s,
+  // probes ep0, leaves a record and reboots (check_out_stuck_).
+  void watch_set_(const PendingSlot &slot, uint32_t since_ms);  // slot is about to be submitted
+  void watch_since_(const PendingSlot &slot, uint32_t since_ms);
+  void watch_orphan_(const PendingSlot &slot);
   void check_out_stuck_();
   // Main loop: one GET_STATUS(device) on ep0, waits at most 1 s for its completion.
   usbip::Ep0Probe probe_ep0_();
@@ -245,12 +247,18 @@ class USBIPServer : public usb_host::USBClient {
   uint8_t *intr_out_buf_{nullptr};   // RET_SUBMIT data assembled from the ring (dma_chunk_size_ B)
   std::atomic<uint32_t> prefetch_in_flight_{0};
   std::atomic<uint32_t> intr_out_in_flight_{0};  // interrupt OUT slots submitted, callback not run yet
-  // Out-stuck detector: written by the TCP task (update_out_watch_), read by the main loop. Times are
-  // now_ms_ with 0 = none (a real 0 is stored as 1); the ep is stored before its time.
-  std::atomic<uint32_t> out_watch_oldest_ms_{0};  // submit time of the oldest interrupt OUT slot not released
-  std::atomic<uint8_t> out_watch_oldest_ep_{0};
-  std::atomic<uint32_t> out_watch_orphan_ms_{0};  // since when the oldest orphaned interrupt OUT slot is an orphan
-  std::atomic<uint8_t> out_watch_orphan_ep_{0};
+  // Stuck detector. Bit i of slots_in_flight_: the transfer of slot i is submitted and its callback
+  // has not run (set by the TCP task before the submit, cleared by transfer_cb_ in the USB task
+  // before it posts the completion). The rest is written by the TCP task and read by the main loop:
+  // watch_flags_ (WATCH_*), watch_since_ms_ (usbip::WatchedXfer::since_ms), watch_ep_ (0 = control).
+  static constexpr uint8_t WATCH_USED = 0x01;
+  static constexpr uint8_t WATCH_INTR_OUT = 0x02;
+  static constexpr uint8_t WATCH_ORPHAN = 0x04;
+  std::atomic<uint32_t> slots_in_flight_{0};
+  std::atomic<uint32_t> watch_since_ms_[MAX_PENDING_LIMIT]{};
+  std::atomic<uint8_t> watch_flags_[MAX_PENDING_LIMIT]{};
+  std::atomic<uint8_t> watch_ep_[MAX_PENDING_LIMIT]{};
+  uint32_t out_stuck_timeout_ms_{usbip::kOutStuckTimeoutMs};
   std::atomic<uint8_t> probe_state_{0};           // probe_ep0_: 0 = no completion yet, 1 = completed ok, 2 = error
   // setup_intr_eps_ postponed since (now_ms_, 0 = not postponed) and with how many transfers in flight;
   // written by the TCP task, read by check_intr_setup_stuck_ (main loop).
@@ -363,7 +371,8 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> out_unlink_wait_timeout_{0};  // interrupt OUT did not finish 5 s after CMD_UNLINK
   std::atomic<uint32_t> intr_overflow_{0};           // IN request shorter than the packet -> -EOVERFLOW
   std::atomic<uint32_t> intr_zlp_dropped_{0};        // prefetch completed with 0 B, not stored
-  std::atomic<uint32_t> out_stuck_detected_{0};      // check_out_stuck_: stuck interrupt OUT found (a reboot follows)
+  std::atomic<uint32_t> out_stuck_detected_{0};      // check_out_stuck_: stuck transfer found
+  std::atomic<uint32_t> unlink_orphaned_{0};         // control/bulk did not finish 5 s after CMD_UNLINK
 
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
@@ -371,9 +380,9 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag values (main loop only), same order as in publish_diag_(): the 16
-  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected (log only, no entity). setup() fills it with
+  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected and unlink_orphaned (log only, no entities). setup() fills it with
   // UINT32_MAX = "never published", so the first publish_diag_ emits every value, zeros included.
-  static constexpr size_t DIAG_COUNT = 26;
+  static constexpr size_t DIAG_COUNT = 27;
   uint32_t diag_pub_[DIAG_COUNT]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };

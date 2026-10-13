@@ -6,89 +6,123 @@
 using namespace usbip;
 
 namespace {
-OutWatch in_flight_since(uint32_t submit_ms, uint32_t count = 1) {
-  OutWatch w;
-  w.in_flight = count;
-  w.have_oldest = true;
-  w.oldest_submit_ms = submit_ms;
-  w.oldest_ep = 0x01;
-  return w;
+WatchedXfer intr_out(uint32_t submit_ms) {
+  WatchedXfer x;
+  x.in_flight = true;
+  x.intr_out = true;
+  x.since_ms = submit_ms;
+  x.ep = 0x01;
+  return x;
+}
+WatchedXfer other(uint8_t ep, uint32_t since_ms, bool orphan) {
+  WatchedXfer x;
+  x.in_flight = true;
+  x.orphan = orphan;
+  x.since_ms = since_ms;
+  x.ep = ep;
+  return x;
 }
 }  // namespace
 
 // ---------------------------------------------------------------- decision
 
-TEST_CASE("out stuck: nothing in flight is never stuck") {
-  OutWatch w;
-  CHECK(out_stuck_check(w, 0) == OutStuck::kNone);
-  CHECK(out_stuck_check(w, 1000000) == OutStuck::kNone);
+TEST_CASE("out stuck: an interrupt OUT in flight for more than the limit is stuck") {
+  const WatchedXfer x = intr_out(10000);
+  CHECK(xfer_stuck(x, 10000) == OutStuck::kNone);
+  CHECK(xfer_stuck(x, 10005) == OutStuck::kNone);  // a normal completion takes milliseconds
+  CHECK(xfer_stuck(x, 13000) == OutStuck::kNone);  // exactly 3 s: not yet
+  CHECK(xfer_stuck(x, 13001) == OutStuck::kAge);
+  CHECK(xfer_stuck(x, 10000 + 13 * 3600 * 1000) == OutStuck::kAge);  // the 12.10. case: 13 hours
 }
 
-TEST_CASE("out stuck: a transfer in flight for more than 3 s is stuck") {
-  const OutWatch w = in_flight_since(10000);
-  CHECK(out_stuck_check(w, 10000) == OutStuck::kNone);
-  CHECK(out_stuck_check(w, 10005) == OutStuck::kNone);  // a normal completion takes milliseconds
-  CHECK(out_stuck_check(w, 12999) == OutStuck::kNone);
-  CHECK(out_stuck_check(w, 13000) == OutStuck::kNone);  // exactly 3 s: not yet
-  CHECK(out_stuck_check(w, 13001) == OutStuck::kAge);
-  CHECK(out_stuck_check(w, 10000 + 13 * 3600 * 1000) == OutStuck::kAge);  // the 12.10. case: 13 hours
-}
-
-TEST_CASE("out stuck: the age is judged by the oldest transfer, also across a 32-bit wrap") {
-  const OutWatch w = in_flight_since(0xFFFFF000u, 3);  // submitted 4096 ms before the wrap
-  CHECK(out_stuck_check(w, 0xFFFFF800u) == OutStuck::kNone);  // 2048 ms
-  CHECK(out_stuck_check(w, 0x00000000u) == OutStuck::kAge);   // 4096 ms
-  CHECK(out_stuck_check(w, 0x00001000u) == OutStuck::kAge);
+TEST_CASE("out stuck: across a 32-bit wrap of the clock") {
+  const WatchedXfer x = intr_out(0xFFFFF000u);  // submitted 4096 ms before the wrap
+  CHECK(xfer_stuck(x, 0xFFFFF800u) == OutStuck::kNone);  // 2048 ms
+  CHECK(xfer_stuck(x, 0x00000000u) == OutStuck::kAge);   // 4096 ms
 }
 
 TEST_CASE("out stuck: completed in the USB stack but not released yet is not stuck") {
-  // No session: the TCP task does not drain completions, so the slot (and its submit time) stays,
-  // but the callback has run (in_flight 0).
-  OutWatch w = in_flight_since(1000);
-  w.in_flight = 0;
-  w.have_orphan = true;
-  w.orphan_since_ms = 2000;
-  CHECK(out_stuck_check(w, 1000 + 3600 * 1000) == OutStuck::kNone);
+  // No session: the TCP task does not drain completions, the slot stays, but the callback has run.
+  WatchedXfer x = intr_out(1000);
+  x.orphan = true;
+  x.in_flight = false;
+  CHECK(xfer_stuck(x, 1000 + 3600 * 1000) == OutStuck::kNone);
 }
 
-TEST_CASE("out stuck: an orphaned slot still in flight is stuck after the grace time") {
-  OutWatch w = in_flight_since(50000);
-  w.have_orphan = true;
-  w.orphan_since_ms = 50500;  // session ended 0.5 s after the submit
-  w.orphan_ep = 0x01;
-  CHECK(out_stuck_check(w, 50500) == OutStuck::kNone);    // may still complete right now
-  CHECK(out_stuck_check(w, 51499) == OutStuck::kNone);
-  CHECK(out_stuck_check(w, 51500) == OutStuck::kOrphan);  // 1 s as an orphan, 1.5 s in flight (< 3 s)
+TEST_CASE("out stuck: an orphaned interrupt OUT is judged by the age of the transfer") {
+  // Session ended 2.9 s after the submit: one more check later it is over the limit, without any
+  // extra time counted from the moment it became an orphan.
+  WatchedXfer x = intr_out(50000);
+  x.orphan = true;
+  CHECK(xfer_stuck(x, 52900) == OutStuck::kNone);
+  CHECK(xfer_stuck(x, 53001) == OutStuck::kOrphan);
+  // And a session that ends right after a submit does not make a healthy transfer stuck.
+  WatchedXfer fresh = intr_out(60000);
+  fresh.orphan = true;
+  CHECK(xfer_stuck(fresh, 60002) == OutStuck::kNone);
+  CHECK(xfer_stuck(fresh, 61500) == OutStuck::kNone);
 }
 
-TEST_CASE("out stuck: orphan after the 5 s UNLINK wait is reported by age first") {
-  OutWatch w = in_flight_since(1000);
-  w.have_orphan = true;
-  w.orphan_since_ms = 6000;
-  CHECK(out_stuck_check(w, 6000) == OutStuck::kAge);
-  CHECK(out_stuck_check(w, 7500) == OutStuck::kAge);
+TEST_CASE("out stuck: control and bulk in flight are not stuck by age alone") {
+  // Bulk IN waiting for data for an hour, a control transfer the client has not given up on.
+  CHECK(xfer_stuck(other(0x82, 0, false), 3600 * 1000) == OutStuck::kNone);
+  CHECK(xfer_stuck(other(0x00, 0, false), 60 * 1000) == OutStuck::kNone);
 }
 
-TEST_CASE("out stuck: orphan without a submit time on record still counts") {
-  OutWatch w;
-  w.in_flight = 1;
-  w.have_orphan = true;
-  w.orphan_since_ms = 100;
-  CHECK(out_stuck_check(w, 1099) == OutStuck::kNone);
-  CHECK(out_stuck_check(w, 1100) == OutStuck::kOrphan);
+TEST_CASE("out stuck: control UNLINK without a completion -> orphan after the wait -> stuck") {
+  // CMD_UNLINK at 20 000 (since_ms). The server waits 5 s for the completion, then answers
+  // RET_UNLINK and orphans the slot: by then the limit counted from the UNLINK is long over.
+  WatchedXfer ctrl = other(0x00, 20000, false);
+  CHECK(xfer_stuck(ctrl, 24999) == OutStuck::kNone);  // still waiting for the completion
+  ctrl.orphan = true;
+  CHECK(xfer_stuck(ctrl, 25000) == OutStuck::kOrphan);
 }
 
-TEST_CASE("out stuck: limits are parameters") {
-  const OutWatch w = in_flight_since(0);
-  CHECK(out_stuck_check(w, 501, 500, 100) == OutStuck::kAge);
-  CHECK(out_stuck_check(w, 500, 500, 100) == OutStuck::kNone);
+TEST_CASE("out stuck: bulk orphaned at the end of a session gets the limit to finish its cancel") {
+  // In flight for an hour (idle bulk IN), session ends at 3 600 000: since_ms is the session end,
+  // not the submit, so the cancel that is under way is not mistaken for a stuck transfer.
+  WatchedXfer bulk = other(0x82, 3600000, true);
+  CHECK(xfer_stuck(bulk, 3600000) == OutStuck::kNone);
+  CHECK(xfer_stuck(bulk, 3600020) == OutStuck::kNone);  // cancelled completions arrive within ms
+  CHECK(xfer_stuck(bulk, 3603000) == OutStuck::kNone);
+  CHECK(xfer_stuck(bulk, 3603001) == OutStuck::kOrphan);
+  bulk.in_flight = false;  // CANCELED callback has run
+  CHECK(xfer_stuck(bulk, 3700000) == OutStuck::kNone);
+}
+
+TEST_CASE("out stuck: the limit is a parameter") {
+  const WatchedXfer x = intr_out(0);
+  CHECK(xfer_stuck(x, 501, 500) == OutStuck::kAge);
+  CHECK(xfer_stuck(x, 500, 500) == OutStuck::kNone);
+  CHECK(xfer_stuck(x, 5000, 10000) == OutStuck::kNone);
+}
+
+TEST_CASE("out stuck scan: picks the transfer stuck for the longest time") {
+  WatchedXfer items[5];
+  items[0] = other(0x82, 0, false);     // idle bulk IN: never
+  items[1] = intr_out(9000);            // 1 s old at 10 000: not yet
+  items[2] = intr_out(5000);            // 5 s
+  items[3] = other(0x00, 2000, true);   // control orphan, 8 s since UNLINK
+  items[4] = intr_out(1000);            // 9 s, but its callback has run
+  items[4].in_flight = false;
+  size_t index = 99;
+  CHECK(out_stuck_scan(items, 5, 10000, 3000, &index) == OutStuck::kOrphan);
+  CHECK(index == 3);
+  items[3].in_flight = false;
+  CHECK(out_stuck_scan(items, 5, 10000, 3000, &index) == OutStuck::kAge);
+  CHECK(index == 2);
+  items[2].in_flight = false;
+  index = 99;
+  CHECK(out_stuck_scan(items, 5, 10000, 3000, &index) == OutStuck::kNone);
+  CHECK(index == 99);  // untouched
+  CHECK(out_stuck_scan(items, 0, 10000, 3000, &index) == OutStuck::kNone);
 }
 
 // ---------------------------------------------------------------- record
 
 TEST_CASE("out stuck record: pack/unpack keeps reason, ep0 result and prefetch count") {
   for (OutStuck reason : {OutStuck::kAge, OutStuck::kOrphan}) {
-    for (Ep0Probe ep0 : {Ep0Probe::kNotSent, Ep0Probe::kOk, Ep0Probe::kError, Ep0Probe::kTimeout}) {
+    for (Ep0Probe ep0 : {Ep0Probe::kNotSent, Ep0Probe::kOk, Ep0Probe::kError, Ep0Probe::kTimeout, Ep0Probe::kSkipped}) {
       for (uint8_t pf : {uint8_t{0}, uint8_t{2}, uint8_t{8}}) {
         OutStuckInfo in;
         in.reason = reason;
@@ -114,7 +148,7 @@ TEST_CASE("out stuck record: prefetch count saturates, garbage is refused") {
 
   CHECK_FALSE(out_stuck_unpack(0x0000, &out));  // reason none
   CHECK_FALSE(out_stuck_unpack(0x0030, &out));  // unknown reason
-  CHECK_FALSE(out_stuck_unpack(0x0410, &out));  // unknown ep0 result
+  CHECK_FALSE(out_stuck_unpack(0x0510, &out));  // unknown ep0 result
   CHECK_FALSE(out_stuck_unpack(0xFFFF, &out));  // RTC memory after power loss
 }
 
@@ -147,6 +181,7 @@ TEST_CASE("ep0 probe result names") {
   CHECK(std::string(ep0_probe_str(Ep0Probe::kError)) == "err");
   CHECK(std::string(ep0_probe_str(Ep0Probe::kTimeout)) == "timeout");
   CHECK(std::string(ep0_probe_str(Ep0Probe::kNotSent)) == "not_sent");
+  CHECK(std::string(ep0_probe_str(Ep0Probe::kSkipped)) == "skipped");
 }
 
 // ---------------------------------------------------------------- reboot loop guard

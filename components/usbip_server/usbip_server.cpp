@@ -30,7 +30,8 @@ static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
 // A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
-// Interrupt OUT after CMD_UNLINK: RET_UNLINK at the latest after this long, then the slot is an orphan.
+// After CMD_UNLINK of a transfer in flight: RET_UNLINK at the latest after this long, then the slot is
+// an orphan (interrupt OUT is never cancelled, control cannot be, a bulk cancel may not come back).
 static constexpr uint32_t OUT_UNLINK_WAIT_MS = 5000;
 // Interrupt setup postponed this long (transfers of the previous device still in flight): reboot.
 static constexpr uint32_t INTR_SETUP_STUCK_MS = 10000;
@@ -290,31 +291,26 @@ void USBIPServer::check_intr_setup_stuck_() {
   App.safe_reboot();
 }
 
-// TCP task. Called after every change of an interrupt OUT slot (submitted, orphaned, released).
-void USBIPServer::update_out_watch_() {
-  bool have_oldest = false, have_orphan = false;
-  uint32_t oldest = 0, orphan = 0;
-  uint8_t oldest_ep = 0, orphan_ep = 0;
-  const uint32_t now = now_ms_();
-  for (uint8_t i = 0; i < this->max_pending_; ++i) {
-    const PendingSlot &s = this->slots_[i];
-    if (!s.used || !s.is_intr || s.waiting) continue;
-    // Oldest = largest age (modulo 2^32, as everywhere else).
-    if (!have_oldest || now - s.submit_ms > now - oldest) {
-      have_oldest = true;
-      oldest = s.submit_ms;
-      oldest_ep = s.ep_addr;
-    }
-    if (s.orphan && (!have_orphan || now - s.orphan_ms > now - orphan)) {
-      have_orphan = true;
-      orphan = s.orphan_ms;
-      orphan_ep = s.ep_addr;
-    }
-  }
-  this->out_watch_oldest_ep_.store(oldest_ep, std::memory_order_relaxed);
-  this->out_watch_oldest_ms_.store(have_oldest ? (oldest != 0 ? oldest : 1) : 0, std::memory_order_release);
-  this->out_watch_orphan_ep_.store(orphan_ep, std::memory_order_relaxed);
-  this->out_watch_orphan_ms_.store(have_orphan ? (orphan != 0 ? orphan : 1) : 0, std::memory_order_release);
+// TCP task: what the stuck detector (main loop) may know about a slot. Flags last, so a slot never
+// looks watched with the time or endpoint of its previous use.
+void USBIPServer::watch_set_(const PendingSlot &slot, uint32_t since_ms) {
+  this->watch_flags_[slot.index].store(0, std::memory_order_release);
+  this->watch_ep_[slot.index].store(slot.is_control ? 0 : slot.ep_addr, std::memory_order_relaxed);
+  this->watch_since_ms_[slot.index].store(since_ms, std::memory_order_relaxed);
+  const bool intr_out = slot.is_intr && !slot.dir_in;
+  this->watch_flags_[slot.index].store(static_cast<uint8_t>(WATCH_USED | (intr_out ? WATCH_INTR_OUT : 0)),
+                                       std::memory_order_release);
+}
+
+// Control and bulk only: the time judged starts when the transfer was asked to end (CMD_UNLINK,
+// session end). Interrupt OUT keeps its submit time.
+void USBIPServer::watch_since_(const PendingSlot &slot, uint32_t since_ms) {
+  if (slot.is_intr) return;
+  this->watch_since_ms_[slot.index].store(since_ms, std::memory_order_release);
+}
+
+void USBIPServer::watch_orphan_(const PendingSlot &slot) {
+  this->watch_flags_[slot.index].fetch_or(WATCH_ORPHAN, std::memory_order_release);
 }
 
 // USB task.
@@ -363,9 +359,10 @@ usbip::Ep0Probe USBIPServer::probe_ep0_() {
   return state == 1 ? usbip::Ep0Probe::kOk : usbip::Ep0Probe::kError;
 }
 
-// Main loop, every 1 s (from check_lock_watchdog_). An interrupt OUT transfer the stack never
-// completes keeps its slot for good (it cannot be cancelled: no HALT on a periodic pipe); with all
-// slots taken every transfer is refused while the client stays connected. Nothing here can recover
+// Main loop, every 1 s (from check_lock_watchdog_). A transfer the stack never completes keeps its
+// slot for good: an interrupt OUT (never cancelled: no HALT on a periodic pipe) in flight longer than
+// out_stuck_timeout, or an orphaned slot of any kind that is still in flight that long after it was
+// asked to end. With all slots taken every transfer is refused while the client stays connected. Nothing here can recover
 // the pipe, so: probe ep0, leave a record for the next boot, restart - unless that already happened
 // kGuardMaxReboots times within the last hour of run time (reboot guard), then only report it.
 void USBIPServer::check_out_stuck_() {
@@ -373,23 +370,25 @@ void USBIPServer::check_out_stuck_() {
   usbip::RebootGuard &guard = s_reboot_guard.guard;
   usbip::guard_tick(guard, static_cast<uint32_t>(esp_timer_get_time() / 1000000));
 
-  usbip::OutWatch w;
-  w.in_flight = this->intr_out_in_flight_.load(std::memory_order_acquire);
-  const uint32_t oldest = this->out_watch_oldest_ms_.load(std::memory_order_acquire);
-  const uint32_t orphan = this->out_watch_orphan_ms_.load(std::memory_order_acquire);
-  w.have_oldest = oldest != 0;
-  w.oldest_submit_ms = oldest;
-  w.oldest_ep = this->out_watch_oldest_ep_.load(std::memory_order_relaxed);
-  w.have_orphan = orphan != 0;
-  w.orphan_since_ms = orphan;
-  w.orphan_ep = this->out_watch_orphan_ep_.load(std::memory_order_relaxed);
+  const uint32_t mask = this->slots_in_flight_.load(std::memory_order_acquire);
   const uint32_t now = now_ms_();
-  usbip::OutStuck reason = usbip::out_stuck_check(w, now);
-  // Re-check: the transfer may have completed (and another one started) between the reads.
+  usbip::WatchedXfer xfers[MAX_PENDING_LIMIT];
+  uint8_t flags[MAX_PENDING_LIMIT];
+  for (uint8_t i = 0; i < this->max_pending_; ++i) {
+    flags[i] = this->watch_flags_[i].load(std::memory_order_acquire);
+    xfers[i].in_flight = (mask & (1u << i)) != 0 && (flags[i] & WATCH_USED) != 0;
+    xfers[i].intr_out = (flags[i] & WATCH_INTR_OUT) != 0;
+    xfers[i].orphan = (flags[i] & WATCH_ORPHAN) != 0;
+    xfers[i].since_ms = this->watch_since_ms_[i].load(std::memory_order_relaxed);
+    xfers[i].ep = this->watch_ep_[i].load(std::memory_order_relaxed);
+  }
+  size_t idx = 0;
+  usbip::OutStuck reason = usbip::out_stuck_scan(xfers, this->max_pending_, now, this->out_stuck_timeout_ms_, &idx);
+  // Re-check: the transfer may have completed (and the slot been reused) between the reads.
   if (reason != usbip::OutStuck::kNone &&
-      (this->intr_out_in_flight_.load(std::memory_order_acquire) == 0 ||
-       this->out_watch_oldest_ms_.load(std::memory_order_acquire) != oldest ||
-       this->out_watch_orphan_ms_.load(std::memory_order_acquire) != orphan)) {
+      ((this->slots_in_flight_.load(std::memory_order_acquire) & (1u << idx)) == 0 ||
+       this->watch_flags_[idx].load(std::memory_order_acquire) != flags[idx] ||
+       this->watch_since_ms_[idx].load(std::memory_order_relaxed) != xfers[idx].since_ms)) {
     reason = usbip::OutStuck::kNone;
   }
   // Nothing stuck: also ends a suppressed stop, so that a later one is reported and judged again.
@@ -398,16 +397,19 @@ void USBIPServer::check_out_stuck_() {
 
   usbip::OutStuckInfo info;
   info.reason = reason;
-  info.ep = reason == usbip::OutStuck::kOrphan ? w.orphan_ep : w.oldest_ep;
-  info.age_ms = now - (w.have_oldest ? oldest : orphan);  // since the submit, if known
+  info.ep = xfers[idx].ep;
+  info.age_ms = now - xfers[idx].since_ms;
   const uint32_t pf = this->prefetch_in_flight_.load(std::memory_order_acquire);
   info.prefetch_in_flight = static_cast<uint8_t>(std::min<uint32_t>(pf, 15));
+  const unsigned in_flight = static_cast<unsigned>(__builtin_popcount(mask));
   this->out_stuck_detected_.fetch_add(1, std::memory_order_relaxed);
   const bool suppress = step == usbip::StuckStep::kReportSuppressed;
   const uint8_t kind = suppress ? KIND_OUT_STUCK_SUPPRESSED : KIND_OUT_STUCK;
   // Before the probe as well, in case it does not return.
   store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
-  info.ep0 = this->probe_ep0_();
+  // Does the device still answer on ep0? Pointless if the stuck transfer is the one on ep0: the
+  // probe would only queue behind it.
+  info.ep0 = info.ep == 0 ? usbip::Ep0Probe::kSkipped : this->probe_ep0_();
   store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
   char text[160];
   const size_t n = usbip::out_stuck_format(info, text, sizeof(text), suppress);
@@ -416,15 +418,15 @@ void USBIPServer::check_out_stuck_() {
     // remain reachable) and say so. The transfers stay stuck until someone restarts the device.
     snprintf(text + n, sizeof(text) - n, " (%u reboots in the last %u s, not rebooting)", usbip::kGuardMaxReboots,
              (unsigned) usbip::kGuardWindowS);
-    ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight", text, (unsigned) w.in_flight);
+    ESP_LOGE(TAG, "%s, %u transfer(s) in flight", text, in_flight);
     this->publish_diag_();
 #ifdef USE_TEXT_SENSOR
     if (this->lock_diag_text_sensor_ != nullptr) this->lock_diag_text_sensor_->publish_state(text);
 #endif
     return;
   }
-  ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight, rebooting (OUT_STUCK reboot %u of %u within %u s)", text,
-           (unsigned) w.in_flight, usbip::guard_recent_reboots(guard), usbip::kGuardMaxReboots,
+  ESP_LOGE(TAG, "%s, %u transfer(s) in flight, rebooting (OUT_STUCK reboot %u of %u within %u s)", text,
+           in_flight, usbip::guard_recent_reboots(guard), usbip::kGuardMaxReboots,
            (unsigned) usbip::kGuardWindowS);
   this->publish_diag_();  // the counters as they are now, for the log
   App.safe_reboot();
@@ -491,6 +493,7 @@ void USBIPServer::publish_diag_() {
       this->intr_overflow_.load(std::memory_order_relaxed),
       this->intr_zlp_dropped_.load(std::memory_order_relaxed),
       this->out_stuck_detected_.load(std::memory_order_relaxed),
+      this->unlink_orphaned_.load(std::memory_order_relaxed),
   };
   static const char *const kNames[DIAG_COUNT] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
@@ -498,7 +501,7 @@ void USBIPServer::publish_diag_() {
       "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
       "dev_lock_hold_max_us",
       "intr_q_depth_max", "intr_q_full", "intr_dropped_nosession", "intr_flushed_import", "intr_unlink_waiting",
-      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp_dropped", "out_stuck_detected",
+      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp_dropped", "out_stuck_detected", "unlink_orphaned",
   };
   bool any_changed = false;
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
@@ -506,7 +509,7 @@ void USBIPServer::publish_diag_() {
   }
   if (!any_changed) return;
 
-  char line[768];
+  char line[800];
   int off = 0;
   for (size_t i = 0; i < DIAG_COUNT && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
@@ -525,6 +528,7 @@ void USBIPServer::publish_diag_() {
       this->intr_flushed_import_sensor_, this->intr_unlink_waiting_sensor_, this->out_unlink_wait_timeout_sensor_,
       this->intr_overflow_sensor_,     this->intr_zlp_dropped_sensor_,
       nullptr,  // out_stuck_detected: log only
+      nullptr,  // unlink_orphaned: log only
   };
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
@@ -759,6 +763,8 @@ void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   USBIPServer *const owner = slot->owner;
   const uint8_t index = slot->index;
   const bool intr_out = slot->is_intr && !slot->dir_in;
+  // Before the completion is posted: after it the TCP task may submit this slot again and set the bit.
+  owner->slots_in_flight_.fetch_and(~(1u << index), std::memory_order_release);
   // The queue has room for every slot. Runs in usb_task (a FreeRTOS task, not an ISR).
   if (xQueueSend(owner->done_queue_, &index, 0) != pdTRUE) {
     owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
@@ -852,7 +858,7 @@ void USBIPServer::free_slot_(PendingSlot &slot) {
   slot.waiting = false;
   slot.used = false;
   this->bulk_order_.forget(slot.index);  // bulk: unblocks the endpoint / leaves the FIFO; no-op otherwise
-  if (slot.is_intr) this->update_out_watch_();
+  this->watch_flags_[slot.index].store(0, std::memory_order_release);
 }
 
 void USBIPServer::tcp_task_loop_() {
@@ -1147,6 +1153,14 @@ esp_err_t USBIPServer::submit_locked_(usb_transfer_t *x, bool is_control) {
   return is_control ? usb_host_transfer_submit_control(this->handle_, x) : usb_host_transfer_submit(x);
 }
 
+esp_err_t USBIPServer::submit_slot_(PendingSlot &slot) {
+  const uint32_t bit = 1u << slot.index;
+  this->slots_in_flight_.fetch_or(bit, std::memory_order_release);  // before the submit: the callback clears it
+  const esp_err_t err = this->submit_locked_(slot.xfer, slot.is_control);
+  if (err != ESP_OK) this->slots_in_flight_.fetch_and(~bit, std::memory_order_release);
+  return err;
+}
+
 // Cancels all transfers on the endpoint (ESP-IDF cannot cancel a single transfer). Bulk endpoints only:
 // halting a periodic (interrupt) pipe can wait forever in ESP-IDF 5.5.
 // Sequence halt -> flush -> clear follows usbipdcpp_esp32 (cancel_endpoint_all_transfers).
@@ -1304,10 +1318,10 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
 
 bool USBIPServer::start_data_transfer_(int sock, PendingSlot &slot) {
   slot.waiting = false;
-  slot.submit_ms = now_ms_();
+  this->watch_set_(slot, now_ms_());
   // Interrupt OUT in flight (on_disconnected waits for it): counted before the submit, the callback decrements.
   if (slot.is_intr) this->intr_out_in_flight_.fetch_add(1, std::memory_order_relaxed);
-  esp_err_t err = this->submit_locked_(slot.xfer, false);
+  esp_err_t err = this->submit_slot_(slot);
   if (err != ESP_OK) {
     if (slot.is_intr) this->intr_out_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     const uint32_t seq = slot.seqnum;
@@ -1322,7 +1336,6 @@ bool USBIPServer::start_data_transfer_(int sock, PendingSlot &slot) {
   } else {
     this->out_submitted_.fetch_add(1, std::memory_order_relaxed);
   }
-  if (slot.is_intr) this->update_out_watch_();
   return true;
 }
 
@@ -1459,7 +1472,8 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
   slot->is_control = true;
   slot->clear_halt_ep = clear_halt_ep;
 
-  esp_err_t err = this->submit_locked_(x, true);
+  this->watch_set_(*slot, now_ms_());
+  esp_err_t err = this->submit_slot_(*slot);
   if (err != ESP_OK) {
     this->free_slot_(*slot);
     ESP_LOGW(TAG, "seq %u: control submit failed: %s -> -EPIPE", (unsigned) seq, esp_err_to_name(err));
@@ -1500,14 +1514,18 @@ bool USBIPServer::handle_unlink_(int sock, const usbip::Message &m) {
       }
       s.unlink_pending = true;
       s.unlink_seqnum = m.unlink.base.seqnum;
+      // Whatever the type: RET_UNLINK goes out with the completion, at the latest OUT_UNLINK_WAIT_MS
+      // from now (intr_service_ answers then and orphans the slot, so the client is never left
+      // waiting and the stuck detector sees the slot).
+      const uint32_t unlink_ms = now_ms_();
+      s.unlink_deadline_ms = unlink_ms + OUT_UNLINK_WAIT_MS;
+      this->watch_since_(s, unlink_ms);
       if (s.is_control) {
         // A control transfer on ep0 cannot be cancelled in ESP-IDF (usbh_ep_get_handle does not
         // know ep0). Wait for completion and send RET_UNLINK instead of RET_SUBMIT.
         ESP_LOGV(TAG, "UNLINK seq %u (ep0) -> reply on completion", (unsigned) target);
       } else if (s.is_intr) {
-        // Interrupt OUT: never halt a periodic pipe. Wait for the completion (RET_UNLINK then), at most
-        // OUT_UNLINK_WAIT_MS (intr_service_ answers and orphans the slot).
-        s.unlink_deadline_ms = now_ms_() + OUT_UNLINK_WAIT_MS;
+        // Interrupt OUT: never halt a periodic pipe. Wait for the completion (RET_UNLINK then).
         ESP_LOGV(TAG, "UNLINK seq %u (interrupt OUT ep %02X) -> reply on completion", (unsigned) target, s.ep_addr);
       } else {
         // Bulk: cancels all transfers on the endpoint; those without unlink_pending are resubmitted.
@@ -1548,7 +1566,7 @@ bool USBIPServer::drain_completions_(int sock) {
       // in_done_err because this branch `continue`s before the classification block below.
       if (s.dir_in) this->in_done_err_.fetch_add(1, std::memory_order_relaxed);
       x->status = USB_TRANSFER_STATUS_COMPLETED;
-      if (this->submit_locked_(x, false) == ESP_OK) {
+      if (this->submit_slot_(s) == ESP_OK) {
         if (s.dir_in) this->in_resubmitted_.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGV(TAG, "seq %u: collateral cancel on ep %02X -> resubmitted", (unsigned) s.seqnum, s.ep_addr);
         continue;
@@ -1572,7 +1590,7 @@ bool USBIPServer::drain_completions_(int sock) {
         x->num_bytes = static_cast<int>(s.plan.submit_len());
         x->flags = s.plan.zero_pack() ? USB_TRANSFER_FLAG_ZERO_PACK : 0;
         if (!s.dir_in) memcpy(x->data_buffer, s.big_buf + s.plan.offset(), s.plan.request_len());
-        if (this->submit_locked_(x, false) == ESP_OK) continue;
+        if (this->submit_slot_(s) == ESP_OK) continue;
         ESP_LOGW(TAG, "seq %u: next chunk on ep %02X failed -> -EPIPE after %u B", (unsigned) s.seqnum, s.ep_addr,
                  (unsigned) s.plan.done());
         chunk_submit_failed = true;
@@ -1686,13 +1704,18 @@ void USBIPServer::end_session_() {
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     // Bulk transfers still waiting in the endpoint FIFO were never submitted: just release them.
     if (this->slots_[i].used && this->slots_[i].waiting) this->free_slot_(this->slots_[i]);
-    if (this->slots_[i].used) {
-      if (!this->slots_[i].orphan) this->slots_[i].orphan_ms = now_ms_();
-      this->slots_[i].orphan = true;
+    PendingSlot &s = this->slots_[i];
+    if (s.used) {
+      if (!s.orphan) {
+        // Control and bulk are judged from now on (unless a CMD_UNLINK already started the clock);
+        // interrupt OUT by the age of the transfer.
+        if (!s.unlink_pending) this->watch_since_(s, now_ms_());
+        this->watch_orphan_(s);
+      }
+      s.orphan = true;
       ++pending;
     }
   }
-  this->update_out_watch_();
   if (pending == 0) return;
 
   // Bulk IN may wait for data forever - cancel pending transfers on bulk endpoints so the slots are
@@ -2067,23 +2090,27 @@ bool USBIPServer::intr_service_(int sock) {
   while (peak > cur && !this->intr_q_depth_max_.compare_exchange_weak(cur, peak, std::memory_order_relaxed)) {
   }
 
-  // Interrupt OUT after CMD_UNLINK: RET_UNLINK at the latest OUT_UNLINK_WAIT_MS later. The slot stays
-  // an orphan, so its later completion sends nothing (no RET_SUBMIT after RET_UNLINK).
+  // Transfer of any type still in flight OUT_UNLINK_WAIT_MS after its CMD_UNLINK: RET_UNLINK now. The
+  // slot stays an orphan, so its later completion sends nothing (no RET_SUBMIT after RET_UNLINK).
   bool ok = true;
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     PendingSlot &s = this->slots_[i];
-    if (!s.used || !s.is_intr || !s.unlink_pending || s.orphan) continue;
+    if (!s.used || s.waiting || !s.unlink_pending || s.orphan) continue;
     if (static_cast<int32_t>(now - s.unlink_deadline_ms) < 0) continue;
-    this->out_unlink_wait_timeout_.fetch_add(1, std::memory_order_relaxed);
-    ESP_LOGW(TAG, "seq %u: interrupt OUT ep %02X not finished %u ms after UNLINK -> RET_UNLINK, orphaned",
-             (unsigned) s.seqnum, s.ep_addr, (unsigned) OUT_UNLINK_WAIT_MS);
+    if (s.is_intr) {
+      this->out_unlink_wait_timeout_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      this->unlink_orphaned_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ESP_LOGW(TAG, "seq %u: %s ep %02X not finished %u ms after UNLINK -> RET_UNLINK, orphaned", (unsigned) s.seqnum,
+             s.is_control ? "control" : (s.is_intr ? "interrupt OUT" : "bulk"), s.is_control ? 0 : s.ep_addr,
+             (unsigned) OUT_UNLINK_WAIT_MS);
     if (ok && sock >= 0) {
       ok = send_ret_unlink_(sock, s.unlink_seqnum, usbip::kLinuxECONNRESET);
       if (!ok) this->send_errors_.fetch_add(1, std::memory_order_relaxed);
     }
     s.orphan = true;
-    s.orphan_ms = now;
-    this->update_out_watch_();
+    this->watch_orphan_(s);
   }
   return ok;
 }

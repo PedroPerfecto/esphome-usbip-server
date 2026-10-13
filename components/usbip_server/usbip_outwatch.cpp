@@ -3,11 +3,27 @@
 
 namespace usbip {
 
-OutStuck out_stuck_check(const OutWatch &w, uint32_t now_ms, uint32_t max_age_ms, uint32_t orphan_grace_ms) {
-  if (w.in_flight == 0) return OutStuck::kNone;
-  if (w.have_oldest && static_cast<uint32_t>(now_ms - w.oldest_submit_ms) > max_age_ms) return OutStuck::kAge;
-  if (w.have_orphan && static_cast<uint32_t>(now_ms - w.orphan_since_ms) >= orphan_grace_ms) return OutStuck::kOrphan;
-  return OutStuck::kNone;
+OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms) {
+  if (!x.in_flight) return OutStuck::kNone;
+  if (static_cast<uint32_t>(now_ms - x.since_ms) <= timeout_ms) return OutStuck::kNone;
+  if (x.orphan) return OutStuck::kOrphan;
+  return x.intr_out ? OutStuck::kAge : OutStuck::kNone;
+}
+
+OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms, uint32_t timeout_ms, size_t *index) {
+  OutStuck found = OutStuck::kNone;
+  uint32_t worst = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const OutStuck r = xfer_stuck(items[i], now_ms, timeout_ms);
+    if (r == OutStuck::kNone) continue;
+    const uint32_t age = now_ms - items[i].since_ms;
+    if (found == OutStuck::kNone || age > worst) {
+      found = r;
+      worst = age;
+      if (index != nullptr) *index = i;
+    }
+  }
+  return found;
 }
 
 const char *ep0_probe_str(Ep0Probe r) {
@@ -18,6 +34,8 @@ const char *ep0_probe_str(Ep0Probe r) {
       return "err";
     case Ep0Probe::kTimeout:
       return "timeout";
+    case Ep0Probe::kSkipped:
+      return "skipped";
     default:
       return "not_sent";
   }
@@ -33,7 +51,7 @@ bool out_stuck_unpack(uint16_t packed, OutStuckInfo *info) {
   const uint8_t reason = (packed >> 4) & 0x0F;
   const uint8_t ep0 = static_cast<uint8_t>(packed >> 8);
   if (reason != static_cast<uint8_t>(OutStuck::kAge) && reason != static_cast<uint8_t>(OutStuck::kOrphan)) return false;
-  if (ep0 > static_cast<uint8_t>(Ep0Probe::kTimeout)) return false;
+  if (ep0 > static_cast<uint8_t>(Ep0Probe::kSkipped)) return false;
   info->reason = static_cast<OutStuck>(reason);
   info->ep0 = static_cast<Ep0Probe>(ep0);
   info->prefetch_in_flight = packed & 0x0F;
