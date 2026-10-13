@@ -757,14 +757,17 @@ bool USBIPServer::device_ready_() {
 
 void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   auto *slot = static_cast<PendingSlot *>(xfer->context);
-  // Read before the queue send: after it the TCP task may free and reuse the slot. is_intr was set
-  // by the TCP task before the submit and does not change while the transfer is in flight.
+  // Everything is read before the queue send: after it the TCP task (possibly on the other core) may
+  // free the slot and hand it out again. These fields were set by the TCP task before the submit and
+  // do not change while the transfer is in flight; nothing of the slot is touched after the send.
+  USBIPServer *const owner = slot->owner;
+  const uint8_t index = slot->index;
   const bool intr_out = slot->is_intr && !slot->dir_in;
   // The queue has room for every slot. Runs in usb_task (a FreeRTOS task, not an ISR).
-  if (xQueueSend(slot->owner->done_queue_, &slot->index, 0) != pdTRUE) {
-    slot->owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
+  if (xQueueSend(owner->done_queue_, &index, 0) != pdTRUE) {
+    owner->cb_queue_full_.fetch_add(1, std::memory_order_relaxed);
   }
-  if (intr_out) slot->owner->intr_out_in_flight_.fetch_sub(1, std::memory_order_release);
+  if (intr_out) owner->intr_out_in_flight_.fetch_sub(1, std::memory_order_release);
 }
 
 // USB task. Same as transfer_cb_, for the prefetch transfers of interrupt IN endpoints.
@@ -835,11 +838,8 @@ USBIPServer::PendingSlot *USBIPServer::alloc_slot_() {
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     if (!this->slots_[i].used) {
       PendingSlot &s = this->slots_[i];
-      USBIPServer *owner = s.owner;
-      uint8_t index = s.index;
-      s = PendingSlot{};
-      s.owner = owner;
-      s.index = index;
+      // Only the state part: owner and index must never be rewritten (see PendingSlot).
+      static_cast<SlotState &>(s) = SlotState{};
       s.used = true;
       return &s;
     }

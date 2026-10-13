@@ -99,15 +99,14 @@ class USBIPServer : public usb_host::USBClient {
 
  protected:
   // Pending URB. Only the TCP task modifies it; the USB task only posts the index to the queue.
-  struct PendingSlot {
-    USBIPServer *owner{nullptr};
+  // Everything about one use of a slot; reset as a whole when the slot is handed out again.
+  struct SlotState {
     usb_transfer_t *xfer{nullptr};
     uint32_t seqnum{0};
     uint32_t start_frame{0};
     uint32_t number_of_packets{0};
     uint32_t requested{0};  // transfer_buffer_length from CMD_SUBMIT
     uint32_t unlink_seqnum{0};
-    uint8_t index{0};
     uint8_t ep_addr{0};        // non-control: endpoint address including direction
     uint8_t clear_halt_ep{0};  // != 0: on success reset the pipe state on the host
     bool used{false};
@@ -123,6 +122,12 @@ class USBIPServer : public usb_host::USBClient {
     bool waiting{false};         // bulk: prepared but not submitted yet, in bulk_order_ (no done_queue_ entry)
     uint8_t *big_buf{nullptr};   // chunked: all data in PSRAM (IN result / OUT source)
     usbip::ChunkPlan plan;       // chunked: split state
+  };
+  // owner and index identify the slot: set once in setup() and never written again, because the
+  // USB task reads them in transfer_cb_ while the TCP task may already be recycling the slot.
+  struct PendingSlot : SlotState {
+    USBIPServer *owner{nullptr};
+    uint8_t index{0};
   };
 
   void on_connected() override;
