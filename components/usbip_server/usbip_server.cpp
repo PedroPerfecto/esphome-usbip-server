@@ -25,6 +25,9 @@ static constexpr uint32_t SESSION_DRAIN_TIMEOUT_MS = 2000;
 // A connection that arrives during a session must deliver its whole request within this time
 // (the TCP task serves nothing else meanwhile).
 static constexpr int64_t SIDE_REQUEST_TIMEOUT_US = 2000 * 1000;
+// A client that stops reading (but keeps the connection) must not hold the TCP task in send() for
+// good: after this long without progress the send fails and the session is closed.
+static constexpr uint32_t SEND_TIMEOUT_S = 5;
 static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 // on_connected/on_disconnected (main loop) leave a record if dev_lock_ is not free after this long.
 static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
@@ -66,6 +69,11 @@ static const char *parse_error_str(usbip::ParseError e) {
       return "none";
   }
 }
+
+// send_all_ is static (no object at hand): sends that failed because SO_SNDTIMEO ran out. Written by
+// the TCP task, read by publish_diag_ (main loop).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+static std::atomic<uint32_t> s_send_timeouts{0};
 
 // ---------------------------------------------------------------- lock diag record
 
@@ -505,6 +513,7 @@ void USBIPServer::publish_diag_() {
       this->intr_zlp_.load(std::memory_order_relaxed),
       this->out_stuck_detected_.load(std::memory_order_relaxed),
       this->unlink_orphaned_.load(std::memory_order_relaxed),
+      s_send_timeouts.load(std::memory_order_relaxed),
   };
   static const char *const kNames[DIAG_COUNT] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
@@ -512,7 +521,7 @@ void USBIPServer::publish_diag_() {
       "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
       "dev_lock_hold_max_us",
       "intr_q_depth_max", "intr_q_full", "intr_dropped_nosession", "intr_flushed_import", "intr_unlink_waiting",
-      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp", "out_stuck_detected", "unlink_orphaned",
+      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp", "out_stuck_detected", "unlink_orphaned", "send_timeouts",
   };
   bool any_changed = false;
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
@@ -520,7 +529,7 @@ void USBIPServer::publish_diag_() {
   }
   if (!any_changed) return;
 
-  char line[800];
+  char line[832];
   int off = 0;
   for (size_t i = 0; i < DIAG_COUNT && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
@@ -540,6 +549,7 @@ void USBIPServer::publish_diag_() {
       this->intr_overflow_sensor_,     this->intr_zlp_sensor_,
       nullptr,  // out_stuck_detected: log only
       nullptr,  // unlink_orphaned: log only
+      nullptr,  // send_timeouts: log only
   };
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
@@ -802,7 +812,16 @@ void USBIPServer::tcp_task_fn_(void *arg) { static_cast<USBIPServer *>(arg)->tcp
 bool USBIPServer::send_all_(int sock, const uint8_t *data, size_t len) {
   while (len > 0) {
     int n = send(sock, data, len, 0);
-    if (n <= 0) return false;
+    if (n <= 0) {
+      // SO_SNDTIMEO (configure_session_socket_): the client did not take the data. The message may
+      // be half sent, so the connection is unusable; every caller ends the session on false.
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        s_send_timeouts.fetch_add(1, std::memory_order_relaxed);
+        ESP_LOGW(TAG, "send timed out after %u s (client not reading), closing the connection",
+                 (unsigned) SEND_TIMEOUT_S);
+      }
+      return false;
+    }
     data += n;
     len -= static_cast<size_t>(n);
   }
@@ -953,6 +972,12 @@ void USBIPServer::configure_session_socket_(int sock) {
   setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
   setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
   setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+  // Keepalive does not help against a client that is alive but not reading: limit send() itself.
+  struct timeval snd {};
+  snd.tv_sec = SEND_TIMEOUT_S;
+  if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd)) != 0) {
+    ESP_LOGW(TAG, "SO_SNDTIMEO not set: errno %d", errno);
+  }
 }
 
 // Reads exactly len bytes, all of them before deadline_us (esp_timer_get_time): the time left goes
@@ -985,6 +1010,9 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
   inet_ntoa_r(client.sin_addr, ip, sizeof(ip));
   // One limit for the whole request (header and import body), so a slow client cannot block us.
   const int64_t deadline = esp_timer_get_time() + SIDE_REQUEST_TIMEOUT_US;
+  struct timeval snd {};  // and for our reply (devlist, refusal)
+  snd.tv_sec = SEND_TIMEOUT_S;
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
 
   uint8_t hdr[usbip::kOpHeaderSize];
   bool peer_closed = false;

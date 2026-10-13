@@ -383,9 +383,9 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag values (main loop only), same order as in publish_diag_(): the 16
-  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected and unlink_orphaned (log only, no entities). setup() fills it with
+  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected, unlink_orphaned and send_timeouts (log only, no entities). setup() fills it with
   // UINT32_MAX = "never published", so the first publish_diag_ emits every value, zeros included.
-  static constexpr size_t DIAG_COUNT = 27;
+  static constexpr size_t DIAG_COUNT = 28;
   uint32_t diag_pub_[DIAG_COUNT]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
