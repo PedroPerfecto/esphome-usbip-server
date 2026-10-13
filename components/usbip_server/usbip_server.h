@@ -221,6 +221,7 @@ class USBIPServer : public usb_host::USBClient {
   // Main loop only: dev_lock_ Take that leaves a record after LOOP_LOCK_WARN_MS, then waits as before.
   void take_dev_lock_from_loop_(uint8_t kind);
   void load_lock_diag_();  // setup(): report and clear the record left by the previous boot
+  void load_reboot_guard_();  // setup(): validate the OUT_STUCK reboot guard (RTC_NOINIT) and count this boot
   void release_interfaces_();
 
   uint16_t port_{3240};
@@ -281,6 +282,9 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint8_t> lock_site_{0};
   std::atomic<uint32_t> dev_lock_hold_max_us_{0};  // written by the TCP task, read+reset by publish_diag_
   uint32_t lock_watchdog_reboots_{0};              // main loop only; only meaningful in the log line
+  // Main loop only: a stuck interrupt OUT was reported in this boot but not answered with a reboot
+  // (reboot guard, usbip_outwatch.h); reported once, the state stays until the next boot.
+  bool out_stuck_suppressed_{false};
 
   // RAII: takes dev_lock_ and records since when/where it is held (see above); the destructor
   // clears the record, folds the hold time into dev_lock_hold_max_us_ and releases the lock.

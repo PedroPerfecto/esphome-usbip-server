@@ -148,3 +148,153 @@ TEST_CASE("ep0 probe result names") {
   CHECK(std::string(ep0_probe_str(Ep0Probe::kTimeout)) == "timeout");
   CHECK(std::string(ep0_probe_str(Ep0Probe::kNotSent)) == "not_sent");
 }
+
+// ---------------------------------------------------------------- reboot loop guard
+
+namespace {
+// One boot: the device runs for run_before_stuck_s, then a stuck transfer is detected.
+// Returns what the guard decides; on kReboot the next call is the next boot.
+GuardAction boot_then_stuck(RebootGuard &g, uint32_t run_before_stuck_s) {
+  guard_boot(g);
+  for (uint32_t t = 0; t <= run_before_stuck_s; t += (run_before_stuck_s - t > 600 ? 600 : 1)) guard_tick(g, t);
+  guard_tick(g, run_before_stuck_s);
+  return guard_on_stuck(g);
+}
+// One boot without a stuck transfer (ended by an OTA, power stays on).
+void boot_healthy(RebootGuard &g, uint32_t run_s) {
+  guard_boot(g);
+  for (uint32_t t = 0; t <= run_s; t += 60) guard_tick(g, t);
+  guard_tick(g, run_s);
+}
+}  // namespace
+
+TEST_CASE("guard: the first three stuck transfers reboot, the fourth within the hour does not") {
+  RebootGuard g{};
+  CHECK(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  CHECK(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  CHECK(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  CHECK(g.reboots == 3);
+  CHECK(boot_then_stuck(g, 30) == GuardAction::kSuppress);
+  CHECK(g.boots == 4);
+  CHECK(g.run_s == 120);  // run time summed over the boots, although every uptime was only 30 s
+  CHECK(guard_recent_reboots(g) == 3);
+}
+
+TEST_CASE("guard: uptime alone would never see the loop") {
+  // Every boot gets stuck after 10 s of uptime: judged by uptime each one looks like the first.
+  RebootGuard g{};
+  int reboots = 0;
+  for (int boot = 0; boot < 50; ++boot) {
+    if (boot_then_stuck(g, 10) == GuardAction::kReboot) ++reboots;
+  }
+  CHECK(reboots == 3);
+  CHECK(g.boots == 50);
+}
+
+TEST_CASE("guard: while suppressed and still stuck it stays suppressed, however long") {
+  RebootGuard g{};
+  for (int i = 0; i < 3; ++i) REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  guard_boot(g);
+  guard_tick(g, 5);
+  REQUIRE(guard_on_stuck(g) == GuardAction::kSuppress);
+  for (uint32_t t = 6; t < 3 * 3600; ++t) {  // the server reports the stop every second
+    guard_tick(g, t);
+    guard_note_stop(g);
+  }
+  CHECK(g.reboots == 3);  // not forgotten: there was never an hour without a stop
+}
+
+TEST_CASE("guard: three reboots spread over more than an hour do not suppress") {
+  RebootGuard g{};
+  CHECK(boot_then_stuck(g, 1500) == GuardAction::kReboot);  // 25 min apart: never an hour without a stop
+  CHECK(boot_then_stuck(g, 1500) == GuardAction::kReboot);
+  CHECK(boot_then_stuck(g, 1500) == GuardAction::kReboot);  // at run time 4500 s
+  // 4th at 6000 s: the first reboot (1500 s) is more than an hour back, only two lie in the window.
+  CHECK(boot_then_stuck(g, 1500) == GuardAction::kReboot);
+  CHECK(g.reboots == 3);  // the oldest was dropped
+  CHECK(g.reboot_s[0] == 3000);
+  CHECK(g.reboot_s[2] == 6000);
+  // 5th only 100 s later (6100 s): 3000, 4500 and 6000 all lie within the hour before it.
+  CHECK(boot_then_stuck(g, 100) == GuardAction::kSuppress);
+}
+
+TEST_CASE("guard: an hour of running without a stuck transfer forgets the reboots") {
+  RebootGuard g{};
+  for (int i = 0; i < 3; ++i) REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  guard_boot(g);
+  guard_tick(g, 3599 - 0);  // 3599 s since the last stop (at run time 90)
+  CHECK(g.reboots == 3);
+  guard_tick(g, 3600);
+  CHECK(g.reboots == 0);
+  CHECK(guard_on_stuck(g) == GuardAction::kReboot);
+  CHECK(g.reboots == 1);
+}
+
+TEST_CASE("guard: the healthy hour may be spread over several boots") {
+  RebootGuard g{};
+  for (int i = 0; i < 3; ++i) REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  boot_healthy(g, 1800);  // e.g. ended by an OTA
+  CHECK(g.reboots == 3);
+  CHECK(guard_recent_reboots(g) == 3);
+  boot_healthy(g, 1800);
+  CHECK(g.reboots == 0);
+}
+
+TEST_CASE("guard: boots that are not OUT_STUCK reboots do not count as such") {
+  RebootGuard g{};
+  for (int i = 0; i < 10; ++i) boot_healthy(g, 20);  // OTA, restart button, watchdog ...
+  CHECK(g.boots == 10);
+  CHECK(g.reboots == 0);
+  CHECK(boot_then_stuck(g, 20) == GuardAction::kReboot);
+}
+
+TEST_CASE("guard: run time never goes backwards and saturates") {
+  RebootGuard g{};
+  guard_boot(g);
+  guard_tick(g, 100);
+  guard_tick(g, 40);  // a late tick with an older value
+  CHECK(g.run_s == 100);
+  g.run_s = UINT32_MAX - 10;
+  guard_boot(g);
+  guard_tick(g, 1000);
+  CHECK(g.run_s == UINT32_MAX);
+}
+
+TEST_CASE("guard: validity check rejects memory that this code cannot have written") {
+  RebootGuard g{};
+  CHECK(guard_valid(g));
+  REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  CHECK(guard_valid(g));
+
+  RebootGuard bad = g;
+  bad.reboots = 4;
+  CHECK_FALSE(guard_valid(bad));
+  bad = g;
+  bad.reboot_s[1] = g.run_s + 1;  // in the future
+  CHECK_FALSE(guard_valid(bad));
+  bad = g;
+  bad.reboot_s[0] = bad.reboot_s[1] + 1;  // not ordered
+  CHECK_FALSE(guard_valid(bad));
+  bad = g;
+  bad.base_s = g.run_s + 5;
+  CHECK_FALSE(guard_valid(bad));
+  std::memset(&bad, 0xFF, sizeof(bad));
+  CHECK_FALSE(guard_valid(bad));
+
+  guard_reset(bad);
+  CHECK(guard_valid(bad));
+  CHECK(bad.boots == 0);
+}
+
+TEST_CASE("out stuck record: suppressed text") {
+  OutStuckInfo info;
+  info.reason = OutStuck::kAge;
+  info.ep = 0x01;
+  info.age_ms = 3200;
+  info.ep0 = Ep0Probe::kOk;
+  info.prefetch_in_flight = 2;
+  char text[128];
+  out_stuck_format(info, text, sizeof(text), true);
+  CHECK(std::string(text) == "OUT_STUCK_SUPPRESSED ep=01 age=3200 ms reason=age ep0=ok prefetch=2");
+}

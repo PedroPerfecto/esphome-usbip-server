@@ -79,6 +79,8 @@ enum LockDiagKind : uint8_t {
   // Interrupt OUT never completed. Fields used differently: site = endpoint address, reserved =
   // usbip::out_stuck_pack (reason, ep0 probe result, prefetch transfers in flight), held_ms = age.
   KIND_OUT_STUCK = 5,
+  // Same fields as KIND_OUT_STUCK, but the server did not reboot (too many OUT_STUCK reboots).
+  KIND_OUT_STUCK_SUPPRESSED = 6,
 };
 struct LockDiagRecord {
   uint32_t magic;
@@ -105,6 +107,17 @@ void store_lock_diag(uint8_t kind, uint8_t site, uint32_t held_ms, uint16_t rese
   s_lock_diag.magic = LOCK_DIAG_MAGIC;
 }
 
+// Reboot guard of the out-stuck detector (usbip_outwatch.h): its own record, apart from s_lock_diag
+// (that one is cleared at every boot). Same memory rules: garbage after a power loss, hence the
+// magic and guard_valid(). Main loop only.
+constexpr uint32_t REBOOT_GUARD_MAGIC = 0x4F534752;  // "OSGR"
+struct RebootGuardRecord {
+  uint32_t magic;
+  usbip::RebootGuard guard;
+};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+RTC_NOINIT_ATTR RebootGuardRecord s_reboot_guard;
+
 const char *lock_diag_kind_str(uint8_t kind) {
   switch (kind) {
     case KIND_WATCHDOG_REBOOT:
@@ -117,6 +130,8 @@ const char *lock_diag_kind_str(uint8_t kind) {
       return "INTR_SETUP_STUCK";
     case KIND_OUT_STUCK:
       return "OUT_STUCK";
+    case KIND_OUT_STUCK_SUPPRESSED:
+      return "OUT_STUCK_SUPPRESSED";
     default:
       return "unknown";
   }
@@ -127,6 +142,7 @@ const char *lock_diag_kind_str(uint8_t kind) {
 
 void USBIPServer::setup() {
   this->load_lock_diag_();
+  this->load_reboot_guard_();
   if (this->max_pending_ > MAX_PENDING_LIMIT) this->max_pending_ = MAX_PENDING_LIMIT;
   this->interrupt_queue_depth_ = std::min<uint16_t>(
       std::max<uint16_t>(this->interrupt_queue_depth_, usbip::IntrRing::kMinDepth), usbip::IntrRing::kMaxDepth);
@@ -161,13 +177,13 @@ void USBIPServer::load_lock_diag_() {
   char text[128] = "žiadny";
   const LockDiagRecord rec = s_lock_diag;
   usbip::OutStuckInfo stuck;
-  if (rec.magic == LOCK_DIAG_MAGIC && rec.kind == KIND_OUT_STUCK) {
+  if (rec.magic == LOCK_DIAG_MAGIC && (rec.kind == KIND_OUT_STUCK || rec.kind == KIND_OUT_STUCK_SUPPRESSED)) {
     if (usbip::out_stuck_unpack(rec.reserved, &stuck)) {
       stuck.ep = rec.site;
       stuck.age_ms = rec.held_ms;
-      const size_t n = usbip::out_stuck_format(stuck, text, sizeof(text));
+      const size_t n = usbip::out_stuck_format(stuck, text, sizeof(text), rec.kind == KIND_OUT_STUCK_SUPPRESSED);
       snprintf(text + n, sizeof(text) - n, " uptime=%u ms", (unsigned) rec.uptime_ms);
-      ESP_LOGE(TAG, "Previous boot ended with a stuck interrupt OUT transfer: %s", text);
+      ESP_LOGE(TAG, "Previous boot had a stuck interrupt OUT transfer: %s", text);
     }
   } else if (rec.magic == LOCK_DIAG_MAGIC && rec.kind >= KIND_WATCHDOG_REBOOT && rec.kind <= KIND_INTR_SETUP_STUCK &&
              rec.site <= static_cast<uint8_t>(LockSite::CLEAR)) {
@@ -179,6 +195,22 @@ void USBIPServer::load_lock_diag_() {
 #ifdef USE_TEXT_SENSOR
   if (this->lock_diag_text_sensor_ != nullptr) this->lock_diag_text_sensor_->publish_state(text);
 #endif
+}
+
+void USBIPServer::load_reboot_guard_() {
+  if (s_reboot_guard.magic != REBOOT_GUARD_MAGIC || !usbip::guard_valid(s_reboot_guard.guard)) {
+    s_reboot_guard.magic = 0;
+    usbip::guard_reset(s_reboot_guard.guard);
+    std::atomic_thread_fence(std::memory_order_release);
+    s_reboot_guard.magic = REBOOT_GUARD_MAGIC;
+  }
+  usbip::RebootGuard &g = s_reboot_guard.guard;
+  usbip::guard_boot(g);
+  if (g.reboots > 0) {
+    ESP_LOGW(TAG, "OUT_STUCK reboot guard: %u reboot(s) on record (%u within the last %u s of run time), boot %u, run time %u s",
+             g.reboots, usbip::guard_recent_reboots(g), (unsigned) usbip::kGuardWindowS, (unsigned) g.boots,
+             (unsigned) g.run_s);
+  }
 }
 
 void USBIPServer::record_lock_event_(uint8_t kind) {
@@ -334,8 +366,13 @@ usbip::Ep0Probe USBIPServer::probe_ep0_() {
 // Main loop, every 1 s (from check_lock_watchdog_). An interrupt OUT transfer the stack never
 // completes keeps its slot for good (it cannot be cancelled: no HALT on a periodic pipe); with all
 // slots taken every transfer is refused while the client stays connected. Nothing here can recover
-// the pipe, so: probe ep0, leave a record for the next boot, restart.
+// the pipe, so: probe ep0, leave a record for the next boot, restart - unless that already happened
+// kGuardMaxReboots times within the last hour of run time (reboot guard), then only report it.
 void USBIPServer::check_out_stuck_() {
+  // Run time summed over the boots: the clock of the reboot guard (also forgets old reboots).
+  usbip::RebootGuard &guard = s_reboot_guard.guard;
+  usbip::guard_tick(guard, static_cast<uint32_t>(esp_timer_get_time() / 1000000));
+
   usbip::OutWatch w;
   w.in_flight = this->intr_out_in_flight_.load(std::memory_order_acquire);
   if (w.in_flight == 0) return;
@@ -356,6 +393,11 @@ void USBIPServer::check_out_stuck_() {
       this->out_watch_orphan_ms_.load(std::memory_order_acquire) != orphan) {
     return;
   }
+  if (this->out_stuck_suppressed_) {
+    // Already reported in this boot and not rebooting: the stop goes on.
+    usbip::guard_note_stop(guard);
+    return;
+  }
 
   usbip::OutStuckInfo info;
   info.reason = reason;
@@ -364,13 +406,30 @@ void USBIPServer::check_out_stuck_() {
   const uint32_t pf = this->prefetch_in_flight_.load(std::memory_order_acquire);
   info.prefetch_in_flight = static_cast<uint8_t>(std::min<uint32_t>(pf, 15));
   this->out_stuck_detected_.fetch_add(1, std::memory_order_relaxed);
+  const bool suppress = usbip::guard_on_stuck(guard) == usbip::GuardAction::kSuppress;
+  const uint8_t kind = suppress ? KIND_OUT_STUCK_SUPPRESSED : KIND_OUT_STUCK;
   // Before the probe as well, in case it does not return.
-  store_lock_diag(KIND_OUT_STUCK, info.ep, info.age_ms, usbip::out_stuck_pack(info));
+  store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
   info.ep0 = this->probe_ep0_();
-  store_lock_diag(KIND_OUT_STUCK, info.ep, info.age_ms, usbip::out_stuck_pack(info));
-  char text[96];
-  usbip::out_stuck_format(info, text, sizeof(text));
-  ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight, rebooting", text, (unsigned) w.in_flight);
+  store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
+  char text[160];
+  const size_t n = usbip::out_stuck_format(info, text, sizeof(text), suppress);
+  if (suppress) {
+    // Restarting did not help kGuardMaxReboots times within the window: stay up (log, API and OTA
+    // remain reachable) and say so. The transfers stay stuck until someone restarts the device.
+    this->out_stuck_suppressed_ = true;
+    snprintf(text + n, sizeof(text) - n, " (%u reboots in the last %u s, not rebooting)", usbip::kGuardMaxReboots,
+             (unsigned) usbip::kGuardWindowS);
+    ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight", text, (unsigned) w.in_flight);
+    this->publish_diag_();
+#ifdef USE_TEXT_SENSOR
+    if (this->lock_diag_text_sensor_ != nullptr) this->lock_diag_text_sensor_->publish_state(text);
+#endif
+    return;
+  }
+  ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight, rebooting (OUT_STUCK reboot %u of %u within %u s)", text,
+           (unsigned) w.in_flight, usbip::guard_recent_reboots(guard), usbip::kGuardMaxReboots,
+           (unsigned) usbip::kGuardWindowS);
   this->publish_diag_();  // the counters as they are now, for the log
   App.safe_reboot();
 }

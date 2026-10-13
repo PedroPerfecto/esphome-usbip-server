@@ -59,8 +59,47 @@ uint16_t out_stuck_pack(const OutStuckInfo &info);
 // Fills reason/ep0/prefetch_in_flight; false if the field holds values that are not valid.
 bool out_stuck_unpack(uint16_t packed, OutStuckInfo *info);
 
-// "OUT_STUCK ep=01 age=5012 ms reason=age ep0=timeout prefetch=2". Returns the length written
-// (as snprintf, without the terminator), always terminated.
-size_t out_stuck_format(const OutStuckInfo &info, char *out, size_t cap);
+// "OUT_STUCK ep=01 age=5012 ms reason=age ep0=timeout prefetch=2"; with suppressed the text starts
+// with "OUT_STUCK_SUPPRESSED". Returns the length written (as snprintf, without the terminator),
+// always terminated.
+size_t out_stuck_format(const OutStuckInfo &info, char *out, size_t cap, bool suppressed = false);
+
+// Protection against a reboot loop: if the transfer gets stuck again right after every restart,
+// restarting does not help and only keeps the device (and its log) unavailable.
+//
+// There is no wall clock, and uptime starts from 0 at every boot, so time is the run time summed
+// over all boots (run_s) and kept, with the rest of this state, in memory that survives a restart.
+// Plain data without initializers (it lives in RTC_NOINIT memory): start from RebootGuard{} or
+// guard_reset().
+static constexpr uint8_t kGuardMaxReboots = 3;      // this many OUT_STUCK reboots ...
+static constexpr uint32_t kGuardWindowS = 3600;     // ... within this much run time: no further one
+
+struct RebootGuard {
+  uint32_t boots;        // boots since the state was last reset (any reset reason)
+  uint32_t run_s;        // run time summed over those boots [s]
+  uint32_t base_s;       // run_s when this boot started
+  uint32_t last_stop_s;  // run_s when a stuck transfer was last seen
+  uint32_t reboot_s[kGuardMaxReboots];  // run_s of the last OUT_STUCK reboots, oldest first
+  uint8_t reboots;       // valid entries in reboot_s
+};
+
+enum class GuardAction : uint8_t { kReboot, kSuppress };
+
+void guard_reset(RebootGuard &g);
+// False if the fields cannot have been written by this code (e.g. RTC memory after a power loss).
+bool guard_valid(const RebootGuard &g);
+// Once per boot, before the first guard_tick.
+void guard_boot(RebootGuard &g);
+// Periodically (every second): uptime_s of this boot. Forgets the recorded reboots after
+// kGuardWindowS of run time without a stuck transfer.
+void guard_tick(RebootGuard &g, uint32_t uptime_s);
+// A stuck transfer is (still) there, nothing is decided: only keeps the "no stop for an hour"
+// clock from running.
+void guard_note_stop(RebootGuard &g);
+// A stuck transfer was detected and a decision is needed. kReboot: the reboot is recorded, restart
+// now. kSuppress: kGuardMaxReboots reboots already happened within the last kGuardWindowS.
+GuardAction guard_on_stuck(RebootGuard &g);
+// Recorded reboots that still lie within the window.
+uint8_t guard_recent_reboots(const RebootGuard &g);
 
 }  // namespace usbip
