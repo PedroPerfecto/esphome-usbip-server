@@ -419,12 +419,19 @@ void USBIPServer::check_out_stuck_() {
   size_t idx = 0;
   usbip::OutStuck reason = usbip::out_stuck_scan(xfers, this->max_pending_, now, this->out_stuck_timeout_ms_, &idx);
   // Re-check: the transfer may have completed (and the slot been reused) between the reads.
-  if (reason != usbip::OutStuck::kNone &&
-      ((this->slots_in_flight_.load(std::memory_order_acquire) & (1u << idx)) == 0 ||
-       this->watch_flags_[idx].load(std::memory_order_acquire) != flags[idx] ||
-       this->watch_since_ms_[idx].load(std::memory_order_relaxed) != xfers[idx].since_ms)) {
-    reason = usbip::OutStuck::kNone;
-  }
+  // Second reading of one slot, compared with the first (usbip::watch_same).
+  auto unchanged = [this, &xfers, &flags](size_t i) {
+    usbip::WatchSample second;
+    second.in_flight = (this->slots_in_flight_.load(std::memory_order_acquire) & (1u << i)) != 0;
+    second.flags = this->watch_flags_[i].load(std::memory_order_acquire);
+    second.since_ms = this->watch_since_ms_[i].load(std::memory_order_relaxed);
+    usbip::WatchSample first;
+    first.in_flight = xfers[i].in_flight;
+    first.flags = flags[i];
+    first.since_ms = xfers[i].since_ms;
+    return usbip::watch_same(first, second);
+  };
+  if (reason != usbip::OutStuck::kNone && !unchanged(idx)) reason = usbip::OutStuck::kNone;
   // Nothing stuck: also ends a suppressed stop, so that a later one is reported and judged again.
   const usbip::StuckStep step = usbip::stuck_step(this->out_stuck_latch_, guard, reason != usbip::OutStuck::kNone);
   if (step == usbip::StuckStep::kIdle) {
@@ -436,11 +443,7 @@ void USBIPServer::check_out_stuck_() {
       if (usbip::stall_step(xfers[i], reported, now, this->out_stuck_timeout_ms_) != usbip::StallAction::kSoft) continue;
       // Re-check as above, then mark. If the transfer completes right in between, the flag is left on
       // a free slot: watch_set_ clears it at the next use, and stall_on_done ignores it otherwise.
-      if ((this->slots_in_flight_.load(std::memory_order_acquire) & (1u << i)) == 0 ||
-          this->watch_flags_[i].load(std::memory_order_acquire) != flags[i] ||
-          this->watch_since_ms_[i].load(std::memory_order_relaxed) != xfers[i].since_ms) {
-        continue;
-      }
+      if (!unchanged(i)) continue;
       this->stall_flag_[i].store(1, std::memory_order_release);
       this->stall_soft_.fetch_add(1, std::memory_order_relaxed);
       const usbip::Ep0Probe ep0 = this->probe_ep0_();
@@ -2083,6 +2086,7 @@ bool USBIPServer::fail_waiting_(int sock, IntrInEp &ep, int32_t status) {
 }
 
 void USBIPServer::pump_prefetch_(IntrInEp &ep, uint32_t now) {
+  if (ep.active) ep.q.expire_window(now, usbip::kDefaultPrefetchWindowMs);  // every loop pass (intr_service_)
   if (!ep.active || !this->intr_session_ || ep.stalled) return;
   if (ep.need_clear) {
     // A transfer error halted the pipe (the stack flushed the other transfer). Clear it on the host

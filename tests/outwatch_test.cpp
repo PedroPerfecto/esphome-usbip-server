@@ -528,3 +528,41 @@ TEST_CASE("stall: a completion time older than the submit time is not a recovere
   CHECK(st.recovered == 0);
   CHECK(st.max_ms == 0);
 }
+
+// ---------------------------------------------------------------- second reading of a slot
+
+TEST_CASE("watch_same: acted upon only if the second reading equals the first") {
+  WatchSample first;
+  first.in_flight = true;
+  first.flags = 0x03;  // used, interrupt OUT
+  first.since_ms = 500000;
+  WatchSample second = first;
+  CHECK(watch_same(first, second));
+
+  second.in_flight = false;  // completed between the readings
+  CHECK_FALSE(watch_same(first, second));
+
+  second = first;
+  second.since_ms = 500001;  // completed, slot reused for a new transfer
+  CHECK_FALSE(watch_same(first, second));
+
+  second = first;
+  second.flags = 0x07;  // became an orphan in between: judged afresh at the next check
+  CHECK_FALSE(watch_same(first, second));
+
+  second = first;
+  second.flags = 0;  // released, not yet reused (in-flight bit of the next use already set)
+  CHECK_FALSE(watch_same(first, second));
+
+  WatchSample idle = first;
+  idle.in_flight = false;  // a verdict can only concern a transfer that was in flight
+  CHECK_FALSE(watch_same(idle, idle));
+}
+
+TEST_CASE("out stuck: an age of 24.8 days and more is still an age, not 'just submitted'") {
+  // Suppressed stop (no reboot) that lasts for weeks: it must not look resolved at 2^31 ms.
+  const WatchedXfer x = intr_out(1000);
+  CHECK(xfer_stuck(x, 1000 + 0x7FFFFFFFu, 3000) == OutStuck::kAge);
+  CHECK(xfer_stuck(x, 1000 + 0x80000000u, 3000) == OutStuck::kAge);
+  CHECK(xfer_stuck(x, 1000 + 0xC0000000u, 3000) == OutStuck::kAge);
+}

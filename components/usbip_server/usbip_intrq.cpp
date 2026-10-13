@@ -222,6 +222,12 @@ bool IntrInQueue::on_completion(const uint8_t *data, int actual_num_bytes) {
   return this->ring_.push(data, actual_num_bytes > mps ? mps : static_cast<uint16_t>(actual_num_bytes));
 }
 
+void IntrInQueue::expire_window(uint32_t now_ms, uint32_t window_ms) {
+  if (this->have_last_request_ && elapsed32(now_ms, this->last_request_ms_) >= window_ms) {
+    this->have_last_request_ = false;
+  }
+}
+
 bool IntrInQueue::should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms,
                                   uint16_t reserved) const {
   const bool full = static_cast<uint32_t>(this->ring_.size()) + reserved >= this->ring_.depth();

@@ -36,6 +36,17 @@ struct WatchedXfer {
 // else kAge). Control and bulk: only as orphans, and only once since_ms is more than timeout_ms ago.
 // Not in flight (the callback has run, the slot only waits to be released) is never stuck.
 OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms = kOutStuckTimeoutMs);
+// What the detector read about a slot. It is not an atomic snapshot (three separate atomics, two
+// writer tasks), so a verdict is acted upon only if a second reading of the same slot is the same:
+// still in flight, same flags, same time. A slot that completed, was reused or changed its orphan
+// state in between is left for the next check.
+struct WatchSample {
+  bool in_flight{false};
+  uint8_t flags{0};
+  uint32_t since_ms{0};
+};
+bool watch_same(const WatchSample &first, const WatchSample &second);
+
 // The transfer stuck for the longest time among items[0..count); kNone if there is none.
 OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms, uint32_t timeout_ms, size_t *index);
 

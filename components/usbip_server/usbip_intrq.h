@@ -171,6 +171,11 @@ class IntrInQueue {
   bool front_ready(uint32_t *seqnum, IntrServePlan *plan) const;
   void complete_front(const IntrServePlan &plan, uint8_t *out);
 
+  // Forgets the time of the last request once its window has passed (call it periodically, before
+  // should_prefetch). Without it the stored time would look recent again whenever the 32-bit clock
+  // comes back around to it (after 49.7 days without a request), and the prefetch would start
+  // taking packets nobody asked for.
+  void expire_window(uint32_t now_ms, uint32_t window_ms = kDefaultPrefetchWindowMs);
   // A request is waiting or the last one came less than window_ms ago (the client is reading).
   bool request_active(uint32_t now_ms, uint32_t window_ms = kDefaultPrefetchWindowMs) const;
   // reserved: ring entries already promised to transfers in flight; the ring counts as full when

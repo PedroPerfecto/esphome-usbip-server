@@ -11,6 +11,10 @@ OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms) 
   return x.intr_out ? OutStuck::kAge : OutStuck::kNone;
 }
 
+bool watch_same(const WatchSample &first, const WatchSample &second) {
+  return first.in_flight && second.in_flight && first.flags == second.flags && first.since_ms == second.since_ms;
+}
+
 OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms, uint32_t timeout_ms, size_t *index) {
   OutStuck found = OutStuck::kNone;
   uint32_t worst = 0;

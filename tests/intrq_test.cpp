@@ -523,3 +523,54 @@ TEST_CASE("prefetch window: a last request newer than 'now' counts as just arriv
   CHECK(prefetch_allowed(true, false, false, true, 0x00000000u, 0xFFFFFFFFu));  // across the wrap
   CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1050));           // 50 ms ago: closed
 }
+
+TEST_CASE("prefetch window: an idle queue never looks active again, however long the session lasts") {
+  // Last request at t0, then nothing for weeks while the session stays open. The stored time must
+  // not look recent again at 2^31 ms (24.8 days) nor when the clock comes back around (49.7 days).
+  IntrInQueue q;
+  REQUIRE(q.init(8, 64));
+  const uint32_t t0 = 123456;
+  REQUIRE(q.add_request(1, 64, t0));
+  const auto p = pkt(64, 1);
+  REQUIRE(q.on_completion(p.data(), 64));
+  uint32_t seq = 0;
+  IntrServePlan plan;
+  REQUIRE(q.front_ready(&seq, &plan));
+  uint8_t out[64];
+  q.complete_front(plan, out);
+  CHECK(q.should_prefetch(true, t0 + 10));  // within the window: the client is reading
+
+  // The server calls expire_window on every pass of its loop (every few ms).
+  for (uint32_t dt : {uint32_t{49}, uint32_t{50}, uint32_t{51}, uint32_t{1000}}) q.expire_window(t0 + dt);
+  CHECK_FALSE(q.should_prefetch(true, t0 + 51));
+  for (uint32_t dt : {0x7FFFFFFFu, 0x80000000u, 0x80000001u, 0xFFFF0000u, 0xFFFFFFF0u, 0xFFFFFFFFu, 0x00000000u,
+                      0x00000010u}) {
+    CAPTURE(dt);
+    q.expire_window(t0 + dt);
+    CHECK_FALSE(q.should_prefetch(true, t0 + dt));
+    CHECK_FALSE(q.request_active(t0 + dt));
+  }
+  // A new request opens the window again.
+  REQUIRE(q.add_request(2, 64, t0 + 0x00000020u));
+  CHECK(q.should_prefetch(true, t0 + 0x00000020u));
+}
+
+TEST_CASE("prefetch window: expire_window keeps a running window and a just-arrived request") {
+  IntrInQueue q;
+  REQUIRE(q.init(8, 64));
+  REQUIRE(q.add_request(1, 64, 1000));
+  q.expire_window(1049);
+  CHECK(q.request_active(1049));
+  q.expire_window(999);  // 'now' read before the request arrived: not expired
+  REQUIRE(q.unlink(1));
+  CHECK(q.request_active(1049));  // nothing waiting, window still open
+  q.expire_window(1050);
+  CHECK_FALSE(q.request_active(1050));
+  CHECK_FALSE(q.request_active(1010));  // forgotten for good, also for an older 'now'
+}
+
+TEST_CASE("prefetch window: without expiry the raw comparison holds up to a full turn of the clock") {
+  // prefetch_allowed alone (no expire_window): closed at 2^31 ms, as with a plain unsigned difference.
+  CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1000 + 0x80000000u));
+  CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1000 + 0xF0000000u));
+}
