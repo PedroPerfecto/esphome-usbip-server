@@ -744,7 +744,9 @@ void USBIPServer::configure_session_socket_(int sock) {
 
 // Reads exactly len bytes, all of them before deadline_us (esp_timer_get_time): the time left goes
 // into SO_RCVTIMEO before every recv, so a client sending byte by byte cannot stretch the total.
-static bool recv_exact_before(int sock, uint8_t *buf, size_t len, int64_t deadline_us) {
+// *peer_closed: the client closed the connection (recv returned 0) rather than ran out of time.
+static bool recv_exact_before(int sock, uint8_t *buf, size_t len, int64_t deadline_us, bool *peer_closed) {
+  *peer_closed = false;
   while (len > 0) {
     uint32_t ms = 0;
     if (!usbip::recv_timeout_before(esp_timer_get_time(), deadline_us, &ms)) return false;
@@ -753,6 +755,7 @@ static bool recv_exact_before(int sock, uint8_t *buf, size_t len, int64_t deadli
     tv.tv_usec = static_cast<suseconds_t>((ms % 1000) * 1000);
     if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) return false;
     int n = recv(sock, buf, len, 0);
+    if (n == 0) *peer_closed = true;
     if (n <= 0) return false;
     buf += n;
     len -= static_cast<size_t>(n);
@@ -771,9 +774,15 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
   const int64_t deadline = esp_timer_get_time() + SIDE_REQUEST_TIMEOUT_US;
 
   uint8_t hdr[usbip::kOpHeaderSize];
-  if (!recv_exact_before(s, hdr, sizeof(hdr), deadline)) {
-    ESP_LOGW(TAG, "Client %s: no complete request within %u ms during active session, closed", ip,
-             (unsigned) (SIDE_REQUEST_TIMEOUT_US / 1000));
+  bool peer_closed = false;
+  if (!recv_exact_before(s, hdr, sizeof(hdr), deadline, &peer_closed)) {
+    if (peer_closed) {
+      // E.g. a port probe: connect and close. Nothing waited for, not worth a warning.
+      ESP_LOGD(TAG, "Client %s: connection during active session closed by the client without a request", ip);
+    } else {
+      ESP_LOGW(TAG, "Client %s: no complete request within %u ms during active session, closed", ip,
+               (unsigned) (SIDE_REQUEST_TIMEOUT_US / 1000));
+    }
     close(s);
     return -1;
   }
@@ -792,7 +801,7 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
   uint8_t raw_busid[usbip::kBusIdSize];
   char busid[usbip::kBusIdSize];
   if (op.version == usbip::kVersion && op.code == usbip::kOpReqImport &&
-      recv_exact_before(s, raw_busid, sizeof(raw_busid), deadline) && usbip::decode_req_import_busid(raw_busid, busid)) {
+      recv_exact_before(s, raw_busid, sizeof(raw_busid), deadline, &peer_closed) && usbip::decode_req_import_busid(raw_busid, busid)) {
     // Only an import that would succeed may end the running session. Anything else is answered
     // here and the session (and import_count_, client_addr_) stays untouched.
     const bool ready = this->device_ready_();
