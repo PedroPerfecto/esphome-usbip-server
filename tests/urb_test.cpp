@@ -58,3 +58,26 @@ TEST_CASE("control_out_lengths_ok: payload missing although the lengths agree is
   CHECK_FALSE(control_out_lengths_ok(7, 7, 0));
   CHECK_FALSE(control_out_lengths_ok(7, 7, 6));
 }
+
+TEST_CASE("control_in_reply_len: filtered config descriptor longer than transfer_buffer_length is cut to it") {
+  // GET_DESCRIPTOR(CONFIG) answered by the server: 60 B descriptor, wLength 255, client buffer 9 B.
+  // A RET_SUBMIT with actual_length 60 would exceed the client's buffer.
+  CHECK(control_in_reply_len(60, 255, 9) == 9);
+  CHECK(control_in_reply_len(60, 255, 0) == 0);
+}
+
+TEST_CASE("control_in_reply_len: min(data, wLength, transfer_buffer_length)") {
+  CHECK(control_in_reply_len(60, 255, 255) == 60);  // data is the shortest
+  CHECK(control_in_reply_len(60, 9, 9) == 9);       // usual config header read
+  CHECK(control_in_reply_len(60, 9, 255) == 9);     // wLength is the shortest
+  CHECK(control_in_reply_len(0, 9, 9) == 0);
+  CHECK(control_in_reply_len(512, 65535, 131072) == 512);
+  CHECK(control_in_reply_len(70000, 65535, 131072) == 65535);
+}
+
+TEST_CASE("control_in_reply_len as the limit for a forwarded IN reply") {
+  // Slot limit = min(wLength, transfer_buffer_length); the device data is clamped to it.
+  const uint32_t limit = control_in_reply_len(9, 18, 9);  // wLength 18, client buffer 9
+  CHECK(limit == 9);
+  CHECK(control_data_len(8 + 18, limit) == 9);
+}

@@ -27,6 +27,11 @@ SetupInfo parse_setup(const uint8_t setup[kSetupPacketSize]);
 // to the range 0..requested.
 uint32_t control_data_len(int actual_num_bytes_with_setup, uint32_t requested);
 
+// Control IN: number of data bytes in RET_SUBMIT. Never more than the data there is, than the
+// setup packet asked for (wLength), or than the client's buffer holds (transfer_buffer_length; a
+// longer reply makes Linux vhci drop the connection).
+uint32_t control_in_reply_len(uint32_t data_len, uint16_t wLength, uint32_t transfer_buffer_length);
+
 // Control OUT (host-to-device data stage): the device gets exactly wLength bytes taken from the
 // CMD_SUBMIT payload, so wLength, transfer_buffer_length and the payload length actually received
 // must all be equal (Linux usb_submit_urb refuses wLength != transfer_buffer_length with -EBADR).

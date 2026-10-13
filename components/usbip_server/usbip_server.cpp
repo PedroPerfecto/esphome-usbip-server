@@ -1155,7 +1155,8 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
     uint16_t len = 0;
     xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
     if (this->dev_ready_ && this->cfg_filtered_len_ > 0) {
-      len = std::min<uint16_t>(this->cfg_filtered_len_, si.wLength);
+      len = static_cast<uint16_t>(
+          usbip::control_in_reply_len(this->cfg_filtered_len_, si.wLength, c.transfer_buffer_length));
       memcpy(cfg, this->cfg_filtered_, len);
     }
     const bool filtered = this->cfg_filtered_len_ > 0;
@@ -1246,7 +1247,9 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
   slot->seqnum = seq;
   slot->start_frame = c.start_frame;
   slot->number_of_packets = c.number_of_packets;
-  slot->requested = c.transfer_buffer_length;
+  // Limit for the data in RET_SUBMIT (control_data_len): IN is min(wLength, transfer_buffer_length),
+  // OUT has both equal (checked above).
+  slot->requested = usbip::control_in_reply_len(c.transfer_buffer_length, si.wLength, c.transfer_buffer_length);
   slot->dir_in = si.dir_in;
   slot->is_control = true;
   slot->clear_halt_ep = clear_halt_ep;
