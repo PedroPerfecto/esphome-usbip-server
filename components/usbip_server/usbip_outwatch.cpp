@@ -26,6 +26,23 @@ OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms,
   return found;
 }
 
+StallAction stall_step(const WatchedXfer &x, bool soft_reported, uint32_t now_ms, uint32_t hard_ms, uint32_t soft_ms) {
+  if (xfer_stuck(x, now_ms, hard_ms) != OutStuck::kNone) return StallAction::kHard;
+  if (!x.in_flight || !x.intr_out || soft_reported) return StallAction::kNone;
+  return static_cast<uint32_t>(now_ms - x.since_ms) > soft_ms ? StallAction::kSoft : StallAction::kNone;
+}
+
+bool stall_on_done(StallStats &stats, bool soft_reported, uint32_t since_ms, uint32_t done_ms, uint32_t *duration_ms,
+                   uint32_t soft_ms) {
+  if (!soft_reported) return false;
+  const uint32_t duration = done_ms - since_ms;
+  if (duration <= soft_ms) return false;
+  ++stats.recovered;
+  if (duration > stats.max_ms) stats.max_ms = duration;
+  if (duration_ms != nullptr) *duration_ms = duration;
+  return true;
+}
+
 const char *ep0_probe_str(Ep0Probe r) {
   switch (r) {
     case Ep0Probe::kOk:

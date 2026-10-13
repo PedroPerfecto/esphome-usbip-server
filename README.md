@@ -85,7 +85,7 @@ instead of `@main` for a node you depend on.
 | `dma_chunk_size` | `16384` | 64-65536 | Largest single USB transfer, in bytes. Bulk transfers above it are split into chunks of this size (rounded down to a multiple of the endpoint's max packet size); interrupt transfers and control requests (`wLength`) above it fail with `-EPIPE` |
 | `max_pending` | `16` | 1-32 | Maximum transfers in flight at once |
 | `interrupt_queue_depth` | `32` | 4-4096 | Packets stored per interrupt IN endpoint (one entry = one packet of at most the endpoint's max packet size; storage in PSRAM if available) |
-| `out_stuck_timeout` | `3s` | 1s-60s | Stuck detector: an interrupt OUT transfer in flight this long without a completion, or an unlinked/abandoned transfer still in flight this long after it was asked to end, is recorded (`OUT_STUCK`, shown by the `lock_diag` text sensor after the restart) and the device reboots; after 3 such reboots within an hour of run time it only reports (`OUT_STUCK_SUPPRESSED`) |
+| `out_stuck_timeout` | `3s` | 1s-60s | Stuck detector: an interrupt OUT transfer in flight this long without a completion, or an unlinked/abandoned transfer still in flight this long after it was asked to end, is recorded (`OUT_STUCK`, shown by the `lock_diag` text sensor after the restart) and the device reboots; after 3 such reboots within an hour of run time it only reports (`OUT_STUCK_SUPPRESSED`). Independently of this value, an interrupt OUT in flight for more than 3 s is logged and counted as a soft stall (`stall_soft`); if it completes later, `stall_recovered` and `stall_max_ms` record it. With a value above 3 s this measures how long stalls last before the reboot |
 | `interfaces` | all | 0-31, at least one | List of `bInterfaceNumber` values to export |
 
 ### Exporting selected interfaces
@@ -123,6 +123,13 @@ sensor:
 
 All entities are optional and in the diagnostic category. `import_count` counts
 successful imports since boot (`state_class: total_increasing`).
+
+Further optional `sensor` keys are diagnostic counters since boot (transfers,
+unlinks, interrupt queue, stuck detector); `components/usbip_server/sensor.py`
+lists them. For the stuck detector: `stall_soft`, `stall_recovered`,
+`stall_max_ms` (longest stall that ended by itself, in ms),
+`out_stuck_detected`, `unlink_orphaned` (control/bulk transfers still in flight
+5 s after their unlink) and `send_timeouts`.
 
 ## Using the device on a Linux client
 

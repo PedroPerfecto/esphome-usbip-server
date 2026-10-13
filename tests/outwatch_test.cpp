@@ -403,3 +403,81 @@ TEST_CASE("ep0 probe: sent only for a stuck data endpoint when a reboot follows"
   CHECK_FALSE(ep0_probe_wanted(0x01, false));  // suppressed: an unanswered probe would stay on ep0 for good
   CHECK_FALSE(ep0_probe_wanted(0x00, false));
 }
+
+// ---------------------------------------------------------------- soft stall
+
+TEST_CASE("stall: soft after 3 s, once, hard only at out_stuck_timeout") {
+  const WatchedXfer x = intr_out(100000);
+  const uint32_t hard = 60000;
+  CHECK(stall_step(x, false, 100005, hard) == StallAction::kNone);
+  CHECK(stall_step(x, false, 103000, hard) == StallAction::kNone);
+  CHECK(stall_step(x, false, 103001, hard) == StallAction::kSoft);
+  CHECK(stall_step(x, true, 104000, hard) == StallAction::kNone);   // already reported: not again
+  CHECK(stall_step(x, true, 160000, hard) == StallAction::kNone);   // exactly 60 s
+  CHECK(stall_step(x, true, 160001, hard) == StallAction::kHard);
+  CHECK(stall_step(x, false, 160001, hard) == StallAction::kHard);  // hard wins even if soft was missed
+}
+
+TEST_CASE("stall: with out_stuck_timeout at 3 s there is no soft stage") {
+  const WatchedXfer x = intr_out(0);
+  CHECK(stall_step(x, false, 3000, 3000) == StallAction::kNone);
+  CHECK(stall_step(x, false, 3001, 3000) == StallAction::kHard);
+  CHECK(stall_step(x, false, 1500, 1000) == StallAction::kHard);  // hard limit below the soft one
+}
+
+TEST_CASE("stall: only interrupt OUT in flight is a soft stall") {
+  CHECK(stall_step(other(0x82, 0, false), false, 3600000, 60000) == StallAction::kNone);  // idle bulk IN
+  CHECK(stall_step(other(0x00, 0, false), false, 10000, 60000) == StallAction::kNone);    // control
+  WatchedXfer done = intr_out(0);
+  done.in_flight = false;  // callback has run
+  CHECK(stall_step(done, false, 10000, 60000) == StallAction::kNone);
+}
+
+TEST_CASE("stall: an orphaned interrupt OUT is still soft first, hard by its age") {
+  // UNLINK + 5 s wait made it an orphan at 8 s; the hard limit is 60 s from the submission.
+  WatchedXfer x = intr_out(0);
+  CHECK(stall_step(x, false, 3500, 60000) == StallAction::kSoft);
+  x.orphan = true;
+  CHECK(stall_step(x, true, 8000, 60000) == StallAction::kNone);
+  CHECK(stall_step(x, true, 60001, 60000) == StallAction::kHard);
+}
+
+TEST_CASE("stall: control/bulk orphans go straight to hard (no soft stage for them)") {
+  const WatchedXfer ctrl = other(0x00, 20000, true);
+  CHECK(stall_step(ctrl, false, 25000, 60000) == StallAction::kNone);
+  CHECK(stall_step(ctrl, false, 80001, 60000) == StallAction::kHard);
+}
+
+TEST_CASE("stall: a reported transfer that completes is counted with its length") {
+  StallStats st;
+  uint32_t dur = 0;
+  CHECK(stall_on_done(st, true, 100000, 107250, &dur));  // completed 7.25 s after its submission
+  CHECK(dur == 7250);
+  CHECK(st.recovered == 1);
+  CHECK(st.max_ms == 7250);
+  CHECK(stall_on_done(st, true, 200000, 204100, &dur));
+  CHECK(st.recovered == 2);
+  CHECK(st.max_ms == 7250);  // the longest stays
+  CHECK(stall_on_done(st, true, 300000, 341000, &dur));
+  CHECK(st.max_ms == 41000);
+  CHECK(st.recovered == 3);
+}
+
+TEST_CASE("stall: completions without a reported stall are not counted") {
+  StallStats st;
+  uint32_t dur = 77;
+  CHECK_FALSE(stall_on_done(st, false, 1000, 1004, &dur));   // normal transfer
+  CHECK_FALSE(stall_on_done(st, false, 1000, 9000, &dur));   // long, but ended between two checks: never reported
+  CHECK_FALSE(stall_on_done(st, true, 5000, 5003, &dur));    // stale flag from the slot's previous use
+  CHECK_FALSE(stall_on_done(st, true, 5000, 8000, &dur));    // exactly the soft limit
+  CHECK(st.recovered == 0);
+  CHECK(st.max_ms == 0);
+  CHECK(dur == 77);
+}
+
+TEST_CASE("stall: length across a 32-bit wrap of the clock") {
+  StallStats st;
+  uint32_t dur = 0;
+  CHECK(stall_on_done(st, true, 0xFFFFF000u, 0x00001000u, &dur));
+  CHECK(dur == 0x2000);
+}

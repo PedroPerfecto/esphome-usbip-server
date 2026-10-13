@@ -314,6 +314,7 @@ void USBIPServer::check_intr_setup_stuck_() {
 // looks watched with the time or endpoint of its previous use.
 void USBIPServer::watch_set_(const PendingSlot &slot, uint32_t since_ms) {
   this->watch_flags_[slot.index].store(0, std::memory_order_release);
+  this->stall_flag_[slot.index].store(0, std::memory_order_relaxed);
   this->watch_ep_[slot.index].store(slot.is_control ? 0 : slot.ep_addr, std::memory_order_relaxed);
   this->watch_since_ms_[slot.index].store(since_ms, std::memory_order_relaxed);
   const bool intr_out = slot.is_intr && !slot.dir_in;
@@ -342,6 +343,13 @@ void USBIPServer::probe_cb_(usb_transfer_t *xfer) {
 // transfer cannot be cancelled: after EP0_PROBE_TIMEOUT_MS it is left to the stack (a reboot follows).
 usbip::Ep0Probe USBIPServer::probe_ep0_() {
   static const uint8_t GET_STATUS_DEVICE[usbip::kSetupPacketSize] = {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00};
+  if (this->probe_pending_ != nullptr) {
+    // An earlier probe is still without an answer: ep0 is as dead as it was, and a second transfer
+    // would only queue behind it (and probe_state_ belongs to that one).
+    if (this->probe_state_.load(std::memory_order_acquire) == 0) return usbip::Ep0Probe::kTimeout;
+    usb_host_transfer_free(this->probe_pending_);  // it did complete in the meantime
+    this->probe_pending_ = nullptr;
+  }
   usb_transfer_t *x = nullptr;
   if (usb_host_transfer_alloc(usbip::kSetupPacketSize + 2, 0, &x) != ESP_OK || x == nullptr) {
     return usbip::Ep0Probe::kNotSent;
@@ -373,7 +381,10 @@ usbip::Ep0Probe USBIPServer::probe_ep0_() {
     vTaskDelay(pdMS_TO_TICKS(EP0_PROBE_POLL_MS));
   }
   if (state == 0) state = this->probe_state_.load(std::memory_order_acquire);
-  if (state == 0) return usbip::Ep0Probe::kTimeout;  // x stays with the stack
+  if (state == 0) {
+    this->probe_pending_ = x;  // stays with the stack; freed by the next probe once it has completed
+    return usbip::Ep0Probe::kTimeout;
+  }
   usb_host_transfer_free(x);
   return state == 1 ? usbip::Ep0Probe::kOk : usbip::Ep0Probe::kError;
 }
@@ -412,7 +423,32 @@ void USBIPServer::check_out_stuck_() {
   }
   // Nothing stuck: also ends a suppressed stop, so that a later one is reported and judged again.
   const usbip::StuckStep step = usbip::stuck_step(this->out_stuck_latch_, guard, reason != usbip::OutStuck::kNone);
-  if (step == usbip::StuckStep::kIdle || step == usbip::StuckStep::kQuiet) return;
+  if (step == usbip::StuckStep::kIdle) {
+    // Nothing is over out_stuck_timeout. Soft stage: an interrupt OUT in flight for more than
+    // kStallSoftMs is reported once (count, ep0 probe, log) and left alone; free_slot_ records how
+    // long it took if it completes. Never reached with out_stuck_timeout <= kStallSoftMs.
+    for (uint8_t i = 0; i < this->max_pending_; ++i) {
+      const bool reported = this->stall_flag_[i].load(std::memory_order_acquire) != 0;
+      if (usbip::stall_step(xfers[i], reported, now, this->out_stuck_timeout_ms_) != usbip::StallAction::kSoft) continue;
+      // Re-check as above, then mark. If the transfer completes right in between, the flag is left on
+      // a free slot: watch_set_ clears it at the next use, and stall_on_done ignores it otherwise.
+      if ((this->slots_in_flight_.load(std::memory_order_acquire) & (1u << i)) == 0 ||
+          this->watch_flags_[i].load(std::memory_order_acquire) != flags[i] ||
+          this->watch_since_ms_[i].load(std::memory_order_relaxed) != xfers[i].since_ms) {
+        continue;
+      }
+      this->stall_flag_[i].store(1, std::memory_order_release);
+      this->stall_soft_.fetch_add(1, std::memory_order_relaxed);
+      const usbip::Ep0Probe ep0 = this->probe_ep0_();
+      ESP_LOGW(TAG, "Interrupt OUT ep %02X: no completion for %u ms (soft stall), ep0=%s, prefetch in flight %u, "
+                    "reboot at %u ms",
+               xfers[i].ep, (unsigned) (now - xfers[i].since_ms), usbip::ep0_probe_str(ep0),
+               (unsigned) this->prefetch_in_flight_.load(std::memory_order_acquire),
+               (unsigned) this->out_stuck_timeout_ms_);
+    }
+    return;
+  }
+  if (step == usbip::StuckStep::kQuiet) return;
 
   usbip::OutStuckInfo info;
   info.reason = reason;
@@ -513,6 +549,9 @@ void USBIPServer::publish_diag_() {
       this->out_stuck_detected_.load(std::memory_order_relaxed),
       this->unlink_orphaned_.load(std::memory_order_relaxed),
       s_send_timeouts.load(std::memory_order_relaxed),
+      this->stall_soft_.load(std::memory_order_relaxed),
+      this->stall_recovered_.load(std::memory_order_relaxed),
+      this->stall_max_ms_.load(std::memory_order_relaxed),
   };
   static const char *const kNames[DIAG_COUNT] = {
       "in_submitted", "in_done_data", "in_done_empty", "in_done_err",  "in_ret_sent",    "out_submitted",
@@ -521,6 +560,7 @@ void USBIPServer::publish_diag_() {
       "dev_lock_hold_max_us",
       "intr_q_depth_max", "intr_q_full", "intr_dropped_nosession", "intr_flushed_import", "intr_unlink_waiting",
       "out_unlink_wait_timeout", "intr_overflow", "intr_zlp", "out_stuck_detected", "unlink_orphaned", "send_timeouts",
+      "stall_soft", "stall_recovered", "stall_max_ms",
   };
   bool any_changed = false;
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
@@ -528,7 +568,7 @@ void USBIPServer::publish_diag_() {
   }
   if (!any_changed) return;
 
-  char line[832];
+  char line[900];
   int off = 0;
   for (size_t i = 0; i < DIAG_COUNT && off < static_cast<int>(sizeof(line)); ++i) {
     off += snprintf(line + off, sizeof(line) - off, "%s%s=%u", i == 0 ? "" : " ", kNames[i], (unsigned) v[i]);
@@ -546,9 +586,8 @@ void USBIPServer::publish_diag_() {
       this->intr_q_depth_max_sensor_,  this->intr_q_full_sensor_,  this->intr_dropped_nosession_sensor_,
       this->intr_flushed_import_sensor_, this->intr_unlink_waiting_sensor_, this->out_unlink_wait_timeout_sensor_,
       this->intr_overflow_sensor_,     this->intr_zlp_sensor_,
-      nullptr,  // out_stuck_detected: log only
-      nullptr,  // unlink_orphaned: log only
-      nullptr,  // send_timeouts: log only
+      this->out_stuck_detected_sensor_, this->unlink_orphaned_sensor_, this->send_timeouts_sensor_,
+      this->stall_soft_sensor_,        this->stall_recovered_sensor_, this->stall_max_ms_sensor_,
   };
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
     if (sensors[i] != nullptr && v[i] != this->diag_pub_[i]) sensors[i]->publish_state(static_cast<float>(v[i]));
@@ -785,6 +824,7 @@ void USBIPServer::transfer_cb_(usb_transfer_t *xfer) {
   USBIPServer *const owner = slot->owner;
   const uint8_t index = slot->index;
   const bool intr_out = slot->is_intr && !slot->dir_in;
+  owner->watch_done_ms_[index].store(now_ms_(), std::memory_order_relaxed);
   // Before the completion is posted: after it the TCP task may submit this slot again and set the bit.
   owner->slots_in_flight_.fetch_and(~(1u << index), std::memory_order_release);
   // The queue has room for every slot. Runs in usb_task (a FreeRTOS task, not an ISR).
@@ -889,6 +929,20 @@ void USBIPServer::free_slot_(PendingSlot &slot) {
   slot.waiting = false;
   slot.used = false;
   this->bulk_order_.forget(slot.index);  // bulk: unblocks the endpoint / leaves the FIFO; no-op otherwise
+  // A soft stall was reported for this transfer and it completed after all: how long did it take?
+  if (this->stall_flag_[slot.index].exchange(0, std::memory_order_acq_rel) != 0) {
+    usbip::StallStats st;
+    st.recovered = this->stall_recovered_.load(std::memory_order_relaxed);
+    st.max_ms = this->stall_max_ms_.load(std::memory_order_relaxed);
+    uint32_t duration = 0;
+    if (usbip::stall_on_done(st, true, this->watch_since_ms_[slot.index].load(std::memory_order_relaxed),
+                             this->watch_done_ms_[slot.index].load(std::memory_order_relaxed), &duration)) {
+      this->stall_recovered_.store(st.recovered, std::memory_order_relaxed);
+      this->stall_max_ms_.store(st.max_ms, std::memory_order_relaxed);
+      ESP_LOGW(TAG, "Interrupt OUT ep %02X: stalled transfer completed after %u ms (seq %u)", slot.ep_addr,
+               (unsigned) duration, (unsigned) slot.seqnum);
+    }
+  }
   this->watch_flags_[slot.index].store(0, std::memory_order_release);
 }
 

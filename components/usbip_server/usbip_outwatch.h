@@ -37,6 +37,33 @@ OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms =
 // The transfer stuck for the longest time among items[0..count); kNone if there is none.
 OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms, uint32_t timeout_ms, size_t *index);
 
+// Soft stall: an interrupt OUT in flight longer than kStallSoftMs is reported and counted, but not
+// acted upon. Only when it lasts out_stuck_timeout does the hard path (record, reboot) follow. With
+// out_stuck_timeout above kStallSoftMs this measures how long stalls last and how many end by
+// themselves; with out_stuck_timeout at or below it there is no soft stage.
+static constexpr uint32_t kStallSoftMs = 3000;
+
+enum class StallAction : uint8_t {
+  kNone,
+  kSoft,  // report the stall of this transfer now (once per transfer)
+  kHard,  // stuck by xfer_stuck with hard_ms: the OUT_STUCK path
+};
+// soft_reported: kSoft was already returned for this transfer.
+StallAction stall_step(const WatchedXfer &x, bool soft_reported, uint32_t now_ms, uint32_t hard_ms,
+                       uint32_t soft_ms = kStallSoftMs);
+
+struct StallStats {
+  uint32_t soft{0};       // soft stalls reported
+  uint32_t recovered{0};  // of those, transfers that completed afterwards
+  uint32_t max_ms{0};     // longest recovered stall: submission to completion
+};
+// A transfer completed (done_ms: when its callback ran, since_ms: when it was submitted). Counts it
+// as recovered if a soft stall had been reported for it. A flag set for a transfer that in fact
+// took no longer than soft_ms (it can be a leftover of the slot's previous use) is ignored.
+// Returns true if it was counted; *duration_ms then holds its length.
+bool stall_on_done(StallStats &stats, bool soft_reported, uint32_t since_ms, uint32_t done_ms, uint32_t *duration_ms,
+                   uint32_t soft_ms = kStallSoftMs);
+
 // Result of the control transfer (GET_STATUS) sent to ep0 when a stuck transfer is detected.
 enum class Ep0Probe : uint8_t {
   kNotSent = 0,  // no device, lock busy, allocation or submit failed

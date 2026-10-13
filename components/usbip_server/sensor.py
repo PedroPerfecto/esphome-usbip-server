@@ -5,6 +5,7 @@ from esphome.const import (
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
+    UNIT_MILLISECOND,
 )
 
 from . import CONF_USBIP_SERVER_ID, USBIPServer
@@ -40,6 +41,12 @@ CONF_INTR_UNLINK_WAITING = "intr_unlink_waiting"
 CONF_OUT_UNLINK_WAIT_TIMEOUT = "out_unlink_wait_timeout"
 CONF_INTR_OVERFLOW = "intr_overflow"
 CONF_INTR_ZLP = "intr_zlp"
+# Stuck detector (usbip_outwatch.h): counters since boot, total_increasing.
+CONF_OUT_STUCK_DETECTED = "out_stuck_detected"
+CONF_UNLINK_ORPHANED = "unlink_orphaned"
+CONF_SEND_TIMEOUTS = "send_timeouts"
+CONF_STALL_SOFT = "stall_soft"
+CONF_STALL_RECOVERED = "stall_recovered"
 
 _DIAG_COUNTERS = (
     CONF_IN_SUBMITTED,
@@ -65,6 +72,11 @@ _DIAG_COUNTERS = (
     CONF_OUT_UNLINK_WAIT_TIMEOUT,
     CONF_INTR_OVERFLOW,
     CONF_INTR_ZLP,
+    CONF_OUT_STUCK_DETECTED,
+    CONF_UNLINK_ORPHANED,
+    CONF_SEND_TIMEOUTS,
+    CONF_STALL_SOFT,
+    CONF_STALL_RECOVERED,
 )
 
 # Longest dev_lock_ hold around the usb_host_* calls within the last diag period (10 s).
@@ -75,6 +87,10 @@ UNIT_MICROSECOND = "µs"  # not defined in esphome.const
 # Highest number of packets stored in an interrupt IN queue within the last diag period (10 s).
 # A peak that restarts every period, hence measurement.
 CONF_INTR_Q_DEPTH_MAX = "intr_q_depth_max"
+
+# Longest interrupt OUT stall since boot that ended by itself (submission to completion).
+# A maximum that only grows until the next boot, hence measurement.
+CONF_STALL_MAX_MS = "stall_max_ms"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -109,6 +125,13 @@ CONFIG_SCHEMA = cv.Schema(
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             icon="mdi:tray-full",
         ),
+        cv.Optional(CONF_STALL_MAX_MS): sensor.sensor_schema(
+            unit_of_measurement=UNIT_MILLISECOND,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            icon="mdi:timer-alert-outline",
+        ),
     }
 )
 
@@ -128,3 +151,6 @@ async def to_code(config):
     if conf := config.get(CONF_INTR_Q_DEPTH_MAX):
         sens = await sensor.new_sensor(conf)
         cg.add(server.set_intr_q_depth_max_sensor(sens))
+    if conf := config.get(CONF_STALL_MAX_MS):
+        sens = await sensor.new_sensor(conf)
+        cg.add(server.set_stall_max_ms_sensor(sens))

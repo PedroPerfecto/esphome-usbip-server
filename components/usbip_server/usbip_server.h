@@ -87,6 +87,13 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(out_unlink_wait_timeout)
   SUB_SENSOR(intr_overflow)
   SUB_SENSOR(intr_zlp)
+  // Stuck detector (usbip_outwatch.h, see usbip_server.cpp for exact count points).
+  SUB_SENSOR(out_stuck_detected)
+  SUB_SENSOR(unlink_orphaned)
+  SUB_SENSOR(send_timeouts)
+  SUB_SENSOR(stall_soft)
+  SUB_SENSOR(stall_recovered)
+  SUB_SENSOR(stall_max_ms)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -262,6 +269,12 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint8_t> watch_flags_[MAX_PENDING_LIMIT]{};
   std::atomic<uint8_t> watch_ep_[MAX_PENDING_LIMIT]{};
   uint32_t out_stuck_timeout_ms_{usbip::kOutStuckTimeoutMs};
+  // Soft stall (usbip::stall_step). stall_flag_[i] != 0: reported for the transfer in slot i (set by
+  // the main loop, taken by the TCP task when the slot is released). watch_done_ms_[i]: when the
+  // callback of slot i ran (USB task).
+  std::atomic<uint8_t> stall_flag_[MAX_PENDING_LIMIT]{};
+  std::atomic<uint32_t> watch_done_ms_[MAX_PENDING_LIMIT]{};
+  usb_transfer_t *probe_pending_{nullptr};  // main loop only: ep0 probe that got no answer within its limit
   std::atomic<uint8_t> probe_state_{0};           // probe_ep0_: 0 = no completion yet, 1 = completed ok, 2 = error
   // setup_intr_eps_ postponed since (now_ms_, 0 = not postponed) and with how many transfers in flight;
   // written by the TCP task, read by check_intr_setup_stuck_ (main loop).
@@ -376,6 +389,9 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> intr_zlp_{0};        // zero-length packets stored in the ring (prefetch completed with 0 B)
   std::atomic<uint32_t> out_stuck_detected_{0};      // check_out_stuck_: stuck transfer found
   std::atomic<uint32_t> unlink_orphaned_{0};         // control/bulk did not finish 5 s after CMD_UNLINK
+  std::atomic<uint32_t> stall_soft_{0};              // check_out_stuck_: interrupt OUT in flight > 3 s (no reboot yet)
+  std::atomic<uint32_t> stall_recovered_{0};         // free_slot_: such a transfer completed after all
+  std::atomic<uint32_t> stall_max_ms_{0};            // longest of those, submission to completion [ms]
 
   // Last published values (main loop only).
   int8_t pub_usb_{-1};
@@ -383,9 +399,9 @@ class USBIPServer : public usb_host::USBClient {
   uint32_t pub_addr_{0xFFFFFFFFu};
   int64_t pub_imports_{-1};
   // Last published diag values (main loop only), same order as in publish_diag_(): the 16
-  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected, unlink_orphaned and send_timeouts (log only, no entities). setup() fills it with
+  // counters, dev_lock_hold_max_us, the 8 interrupt values, then out_stuck_detected, unlink_orphaned, send_timeouts and the 3 stall values. setup() fills it with
   // UINT32_MAX = "never published", so the first publish_diag_ emits every value, zeros included.
-  static constexpr size_t DIAG_COUNT = 28;
+  static constexpr size_t DIAG_COUNT = 31;
   uint32_t diag_pub_[DIAG_COUNT]{};
   char takeover_busid_[usbip::kBusIdSize]{};  // busid from the taken-over import (TCP task only)
 };
