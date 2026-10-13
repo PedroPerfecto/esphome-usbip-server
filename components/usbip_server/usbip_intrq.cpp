@@ -1,4 +1,5 @@
 #include "usbip_intrq.h"
+#include "usbip_time.h"
 #include <algorithm>
 #include <cstring>
 #include <new>
@@ -180,7 +181,7 @@ bool prefetch_allowed(bool session_active, bool ring_full, bool request_waiting,
                       uint32_t last_request_ms, uint32_t now_ms, uint32_t window_ms) {
   if (!session_active || ring_full) return false;
   if (request_waiting) return true;
-  return have_last_request && static_cast<uint32_t>(now_ms - last_request_ms) < window_ms;
+  return have_last_request && elapsed32(now_ms, last_request_ms) < window_ms;
 }
 
 // ---------------------------------------------------------------- IntrInQueue

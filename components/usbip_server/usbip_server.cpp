@@ -1,6 +1,7 @@
 #include "usbip_server.h"
 #include "usbip_control.h"
 #include "usbip_session.h"
+#include "usbip_time.h"
 #include "usbip_urb.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/application.h"
@@ -234,7 +235,7 @@ void USBIPServer::record_lock_event_(uint8_t kind, bool gave_up) {
   uint32_t held_ms = 0;
   if (since != 0) {  // 0 = the lock is held by a section that is not tracked (or a stale site)
     site = this->lock_site_.load(std::memory_order_relaxed);
-    held_ms = (lock_clock_us_() - since) / 1000;
+    held_ms = usbip::elapsed32(lock_clock_us_(), since) / 1000;
   }
   store_lock_diag(kind, site, held_ms, gave_up ? 1 : 0);
   ESP_LOGE(TAG, "dev_lock_ busy: %s site=%s held=%u ms%s", lock_diag_kind_str(kind), lock_site_str_(site),
@@ -275,7 +276,7 @@ void USBIPServer::check_lock_watchdog_() {
   this->check_out_stuck_();
   const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
   if (since == 0) return;
-  const uint32_t held_us = lock_clock_us_() - since;  // modulo 2^32: correct across a 32-bit wrap
+  const uint32_t held_us = usbip::elapsed32(lock_clock_us_(), since);  // read after `since`; wrap-safe
   if (held_us <= LOCK_WATCHDOG_US) return;
   // Re-check: the section may have finished (and a new one started) between the two reads.
   if (this->lock_since_us_.load(std::memory_order_relaxed) != since) return;
@@ -295,7 +296,7 @@ void USBIPServer::check_lock_watchdog_() {
 void USBIPServer::check_intr_setup_stuck_() {
   const uint32_t since = this->intr_setup_postponed_ms_.load(std::memory_order_acquire);
   if (since == 0) return;
-  const uint32_t waited = now_ms_() - since;  // modulo 2^32
+  const uint32_t waited = usbip::elapsed32(now_ms_(), since);  // read after `since`; wrap-safe
   if (waited <= INTR_SETUP_STUCK_MS) return;
   if (this->intr_setup_postponed_ms_.load(std::memory_order_relaxed) != since) return;  // cleared meanwhile
   // The callbacks did run (the TCP task only has not drained them yet, e.g. no session to retry the
@@ -401,7 +402,6 @@ void USBIPServer::check_out_stuck_() {
   usbip::guard_tick(guard, static_cast<uint32_t>(esp_timer_get_time() / 1000000));
 
   const uint32_t mask = this->slots_in_flight_.load(std::memory_order_acquire);
-  const uint32_t now = now_ms_();
   usbip::WatchedXfer xfers[MAX_PENDING_LIMIT];
   uint8_t flags[MAX_PENDING_LIMIT];
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
@@ -412,6 +412,10 @@ void USBIPServer::check_out_stuck_() {
     xfers[i].since_ms = this->watch_since_ms_[i].load(std::memory_order_relaxed);
     xfers[i].ep = this->watch_ep_[i].load(std::memory_order_relaxed);
   }
+  // "now" only after the slot data: every since_ms read above is then older than it. Read first, a
+  // slot reused by the TCP task in between would carry a time newer than "now". (elapsed32 turns
+  // that into an age of 0 as well; the order keeps real ages from being under-measured.)
+  const uint32_t now = now_ms_();
   size_t idx = 0;
   usbip::OutStuck reason = usbip::out_stuck_scan(xfers, this->max_pending_, now, this->out_stuck_timeout_ms_, &idx);
   // Re-check: the transfer may have completed (and the slot been reused) between the reads.
@@ -442,7 +446,7 @@ void USBIPServer::check_out_stuck_() {
       const usbip::Ep0Probe ep0 = this->probe_ep0_();
       ESP_LOGW(TAG, "Interrupt OUT ep %02X: no completion for %u ms (soft stall), ep0=%s, prefetch in flight %u, "
                     "reboot at %u ms",
-               xfers[i].ep, (unsigned) (now - xfers[i].since_ms), usbip::ep0_probe_str(ep0),
+               xfers[i].ep, (unsigned) usbip::elapsed32(now, xfers[i].since_ms), usbip::ep0_probe_str(ep0),
                (unsigned) this->prefetch_in_flight_.load(std::memory_order_acquire),
                (unsigned) this->out_stuck_timeout_ms_);
     }
@@ -453,7 +457,7 @@ void USBIPServer::check_out_stuck_() {
   usbip::OutStuckInfo info;
   info.reason = reason;
   info.ep = xfers[idx].ep;
-  info.age_ms = now - xfers[idx].since_ms;
+  info.age_ms = usbip::elapsed32(now, xfers[idx].since_ms);
   const uint32_t pf = this->prefetch_in_flight_.load(std::memory_order_acquire);
   info.prefetch_in_flight = static_cast<uint8_t>(std::min<uint32_t>(pf, 15));
   const unsigned in_flight = static_cast<unsigned>(__builtin_popcount(mask));
@@ -745,7 +749,8 @@ bool USBIPServer::teardown() {
   if (this->session_active_) return false;  // TCP task is still closing the session
   // The FIN is queued in lwIP; wait briefly for the tcpip thread to send it
   // (ESPHome gives teardown() at most 1 s in total, TEARDOWN_TIMEOUT_REBOOT_MS).
-  return xTaskGetTickCount() - this->session_closed_tick_ >= pdMS_TO_TICKS(100);
+  const uint32_t closed = this->session_closed_tick_.load();  // before the tick count is read
+  return usbip::elapsed32(xTaskGetTickCount(), closed) >= pdMS_TO_TICKS(100);
 }
 
 void USBIPServer::release_interfaces_() {
@@ -1835,8 +1840,9 @@ void USBIPServer::end_session_() {
     }
   }
 
-  const uint32_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SESSION_DRAIN_TIMEOUT_MS);
-  while (xTaskGetTickCount() < deadline) {
+  // Elapsed time, not a comparison with an absolute deadline: that breaks when the tick count wraps.
+  const uint32_t drain_start = xTaskGetTickCount();
+  while (usbip::elapsed32(xTaskGetTickCount(), drain_start) < pdMS_TO_TICKS(SESSION_DRAIN_TIMEOUT_MS)) {
     this->drain_completions_(-1);
     pending = 0;
     for (uint8_t i = 0; i < this->max_pending_; ++i) {

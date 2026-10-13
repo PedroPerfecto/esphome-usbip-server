@@ -17,7 +17,9 @@ enum class OutStuck : uint8_t {
   kOrphan = 2,  // orphaned slot (answered with RET_UNLINK / session ended) still in flight after the limit
 };
 
-// One slot as the detector sees it. Times in ms, unsigned 32-bit (differences stay valid across a wrap).
+// One slot as the detector sees it. Times in ms, unsigned 32-bit; ages are taken with elapsed32
+// (usbip_time.h): valid across a wrap, and a since_ms newer than "now" (the slot was reused by the
+// other task after "now" was read) is an age of 0, never a huge one.
 struct WatchedXfer {
   bool in_flight{false};  // submitted, completion callback not run yet (USB stack view)
   bool intr_out{false};   // interrupt OUT: completes within milliseconds on a healthy device

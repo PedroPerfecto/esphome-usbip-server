@@ -513,3 +513,13 @@ TEST_CASE("queue: on_completion cuts to MPS and reports a full ring") {
   CHECK(q.on_completion(big.data(), 8));
   CHECK_FALSE(q.on_completion(nullptr, 0));  // full: also a zero-length packet needs an entry
 }
+
+// ---------------------------------------------------------------- time arithmetic
+
+TEST_CASE("prefetch window: a last request newer than 'now' counts as just arrived") {
+  // 'now' was read before the request that set last_request_ms: the window is open, not 49 days old.
+  CHECK(prefetch_allowed(true, false, false, true, 1001, 1000));
+  CHECK(prefetch_allowed(true, false, false, true, 1040, 1000));
+  CHECK(prefetch_allowed(true, false, false, true, 0x00000000u, 0xFFFFFFFFu));  // across the wrap
+  CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1050));           // 50 ms ago: closed
+}

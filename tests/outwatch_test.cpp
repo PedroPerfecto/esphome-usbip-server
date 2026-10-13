@@ -481,3 +481,50 @@ TEST_CASE("stall: length across a 32-bit wrap of the clock") {
   CHECK(stall_on_done(st, true, 0xFFFFF000u, 0x00001000u, &dur));
   CHECK(dur == 0x2000);
 }
+
+// ---------------------------------------------------------------- slot reused during a check
+
+TEST_CASE("out stuck: a slot reused during the check (time 1 ms newer than now) is not stuck") {
+  // Main loop reads "now" = 500 000, the TCP task then frees the slot and submits a new interrupt
+  // OUT in it at 500 001, and only then does the main loop read the slot's time. An unsigned
+  // difference would be 2^32 - 1 ms: far over any limit, and the device would reboot.
+  const uint32_t now = 500000;
+  const WatchedXfer reused = intr_out(now + 1);
+  CHECK(xfer_stuck(reused, now, 3000) == OutStuck::kNone);
+  CHECK(xfer_stuck(reused, now, 60000) == OutStuck::kNone);
+  CHECK(stall_step(reused, false, now, 60000) == StallAction::kNone);
+  CHECK(stall_step(reused, false, now, 3000) == StallAction::kNone);
+
+  WatchedXfer orphan = other(0x00, now + 1, true);  // control slot orphaned just after "now"
+  CHECK(xfer_stuck(orphan, now, 3000) == OutStuck::kNone);
+  CHECK(stall_step(orphan, false, now, 3000) == StallAction::kNone);
+
+  size_t index = 99;
+  const WatchedXfer items[2] = {reused, orphan};
+  CHECK(out_stuck_scan(items, 2, now, 3000, &index) == OutStuck::kNone);
+  CHECK(index == 99);
+}
+
+TEST_CASE("out stuck: the same just before a wrap of the clock, and seconds newer") {
+  CHECK(xfer_stuck(intr_out(0x00000000u), 0xFFFFFFFFu, 3000) == OutStuck::kNone);
+  CHECK(stall_step(intr_out(0x00000000u), false, 0xFFFFFFFFu, 60000) == StallAction::kNone);
+  CHECK(xfer_stuck(intr_out(10000), 2000, 3000) == OutStuck::kNone);  // 8 s "in the future"
+  CHECK(stall_step(intr_out(10000), false, 2000, 60000) == StallAction::kNone);
+}
+
+TEST_CASE("out stuck scan: a reused slot does not hide or outrank a really stuck one") {
+  const uint32_t now = 500000;
+  const WatchedXfer items[2] = {intr_out(now + 1), intr_out(now - 5000)};
+  size_t index = 99;
+  CHECK(out_stuck_scan(items, 2, now, 3000, &index) == OutStuck::kAge);
+  CHECK(index == 1);  // with an unsigned difference the reused slot (2^32 - 1 ms) would win
+}
+
+TEST_CASE("stall: a completion time older than the submit time is not a recovered stall") {
+  // Flag left from the previous use of the slot, done_ms of that use, since_ms of the new one.
+  StallStats st;
+  uint32_t dur = 0;
+  CHECK_FALSE(stall_on_done(st, true, 9000, 8990, &dur));
+  CHECK(st.recovered == 0);
+  CHECK(st.max_ms == 0);
+}

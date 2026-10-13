@@ -1,11 +1,12 @@
 #include "usbip_outwatch.h"
+#include "usbip_time.h"
 #include <cstdio>
 
 namespace usbip {
 
 OutStuck xfer_stuck(const WatchedXfer &x, uint32_t now_ms, uint32_t timeout_ms) {
   if (!x.in_flight) return OutStuck::kNone;
-  if (static_cast<uint32_t>(now_ms - x.since_ms) <= timeout_ms) return OutStuck::kNone;
+  if (elapsed32(now_ms, x.since_ms) <= timeout_ms) return OutStuck::kNone;
   if (x.orphan) return OutStuck::kOrphan;
   return x.intr_out ? OutStuck::kAge : OutStuck::kNone;
 }
@@ -16,7 +17,7 @@ OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms,
   for (size_t i = 0; i < count; ++i) {
     const OutStuck r = xfer_stuck(items[i], now_ms, timeout_ms);
     if (r == OutStuck::kNone) continue;
-    const uint32_t age = now_ms - items[i].since_ms;
+    const uint32_t age = elapsed32(now_ms, items[i].since_ms);
     if (found == OutStuck::kNone || age > worst) {
       found = r;
       worst = age;
@@ -29,13 +30,13 @@ OutStuck out_stuck_scan(const WatchedXfer *items, size_t count, uint32_t now_ms,
 StallAction stall_step(const WatchedXfer &x, bool soft_reported, uint32_t now_ms, uint32_t hard_ms, uint32_t soft_ms) {
   if (xfer_stuck(x, now_ms, hard_ms) != OutStuck::kNone) return StallAction::kHard;
   if (!x.in_flight || !x.intr_out || soft_reported) return StallAction::kNone;
-  return static_cast<uint32_t>(now_ms - x.since_ms) > soft_ms ? StallAction::kSoft : StallAction::kNone;
+  return elapsed32(now_ms, x.since_ms) > soft_ms ? StallAction::kSoft : StallAction::kNone;
 }
 
 bool stall_on_done(StallStats &stats, bool soft_reported, uint32_t since_ms, uint32_t done_ms, uint32_t *duration_ms,
                    uint32_t soft_ms) {
   if (!soft_reported) return false;
-  const uint32_t duration = done_ms - since_ms;
+  const uint32_t duration = elapsed32(done_ms, since_ms);
   if (duration <= soft_ms) return false;
   ++stats.recovered;
   if (duration > stats.max_ms) stats.max_ms = duration;
