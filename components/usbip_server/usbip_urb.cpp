@@ -22,6 +22,10 @@ uint32_t control_in_reply_len(uint32_t data_len, uint16_t wLength, uint32_t tran
   return len;
 }
 
+bool in_overflow(int actual_num_bytes, uint32_t requested) {
+  return actual_num_bytes > 0 && static_cast<uint32_t>(actual_num_bytes) > requested;
+}
+
 bool control_out_lengths_ok(uint16_t wLength, uint32_t transfer_buffer_length, uint32_t payload_len) {
   return wLength == transfer_buffer_length && wLength == payload_len;
 }

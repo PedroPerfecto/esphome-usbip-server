@@ -32,6 +32,11 @@ uint32_t ChunkPlan::complete(uint32_t actual) {
   // IN: a short packet (less than requested) ends the transfer.
   // OUT: less than requested means an error - also the end.
   if (actual < req || done_ >= total_) finished_ = true;
+  // IN chunks are submitted rounded up to MPS, so the device can deliver more than was asked for.
+  if (dir_in_ && actual > req) {
+    overflow_ = true;
+    finished_ = true;
+  }
   return accepted;
 }
 

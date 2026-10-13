@@ -84,3 +84,39 @@ TEST_CASE("zero-length transfer is finished immediately") {
   CHECK(p.finished());
   CHECK(p.done() == 0);
 }
+
+TEST_CASE("IN: more data in the last chunk than requested is an overflow") {
+  // 100 B requested, 64 B chunks and MPS: the second chunk asks for 36 B but is submitted as 64 B.
+  ChunkPlan p(100, 64, 64, true, false);
+  CHECK(p.request_len() == 64);
+  CHECK(p.complete(64) == 64);
+  CHECK_FALSE(p.finished());
+  CHECK_FALSE(p.overflow());
+  CHECK(p.request_len() == 36);
+  CHECK(p.submit_len() == 64);
+  CHECK(p.complete(64) == 36);  // only the requested part belongs to the result
+  CHECK(p.done() == 100);
+  CHECK(p.finished());
+  CHECK(p.overflow());
+}
+
+TEST_CASE("IN: exactly the requested amount or a short packet is not an overflow") {
+  ChunkPlan exact(100, 64, 64, true, false);
+  exact.complete(64);
+  CHECK(exact.complete(36) == 36);
+  CHECK(exact.finished());
+  CHECK_FALSE(exact.overflow());
+
+  ChunkPlan shortp(100, 64, 64, true, false);
+  CHECK(shortp.complete(10) == 10);
+  CHECK(shortp.finished());
+  CHECK_FALSE(shortp.overflow());
+}
+
+TEST_CASE("OUT: never an overflow") {
+  ChunkPlan p(100, 64, 64, false, false);
+  p.complete(64);
+  p.complete(64);  // more than the 36 B asked for: clamped, as before
+  CHECK(p.done() == 100);
+  CHECK_FALSE(p.overflow());
+}

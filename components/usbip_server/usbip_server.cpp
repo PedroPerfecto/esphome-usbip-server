@@ -1666,7 +1666,14 @@ bool USBIPServer::drain_completions_(int sock) {
       }
     }
 
-    const int32_t status = chunk_submit_failed ? usbip::kLinuxEPIPE : map_status_(x->status);
+    // Bulk IN that brought more than the client asked for: the first `requested` bytes, -EOVERFLOW
+    // (interrupt IN reports the same from the ring).
+    bool overflow = false;
+    if (!s.is_control && s.dir_in && x->status == USB_TRANSFER_STATUS_COMPLETED) {
+      overflow = s.chunked ? s.plan.overflow() : usbip::in_overflow(x->actual_num_bytes, s.requested);
+    }
+    const int32_t status = chunk_submit_failed ? usbip::kLinuxEPIPE
+                                               : (overflow ? usbip::kLinuxEOVERFLOW : map_status_(x->status));
     uint32_t len;
     if (s.is_control) {
       len = usbip::control_data_len(x->actual_num_bytes, s.requested);

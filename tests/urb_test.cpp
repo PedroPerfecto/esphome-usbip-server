@@ -81,3 +81,15 @@ TEST_CASE("control_in_reply_len as the limit for a forwarded IN reply") {
   CHECK(limit == 9);
   CHECK(control_data_len(8 + 18, limit) == 9);
 }
+
+TEST_CASE("in_overflow: more data than the client asked for") {
+  // 500 B requested on a 512 B MPS endpoint: submitted as 512, the device fills the packet.
+  CHECK(in_overflow(512, 500));
+  CHECK(in_overflow(65, 64));
+  CHECK_FALSE(in_overflow(500, 500));
+  CHECK_FALSE(in_overflow(12, 500));   // short packet
+  CHECK_FALSE(in_overflow(0, 500));
+  CHECK_FALSE(in_overflow(0, 0));
+  CHECK(in_overflow(64, 0));           // zero-length request, device sent a packet
+  CHECK_FALSE(in_overflow(-1, 500));   // not a length
+}

@@ -21,6 +21,9 @@ class ChunkPlan {
   uint32_t offset() const { return done_; }  // where the current chunk starts in the overall buffer
   uint32_t done() const { return done_; }
   bool finished() const { return finished_; }
+  // IN: the device sent more in the last chunk than was still requested (babble). The excess is not
+  // part of the result; a Linux HCD reports -EOVERFLOW for it.
+  bool overflow() const { return overflow_; }
   uint32_t cap() const { return cap_; }
 
   // Chunk completed successfully with actual bytes transferred. Returns how many bytes
@@ -36,6 +39,7 @@ class ChunkPlan {
   bool dir_in_{false};
   bool zero_packet_{false};
   bool finished_{false};
+  bool overflow_{false};
 };
 
 }  // namespace usbip

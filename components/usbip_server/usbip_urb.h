@@ -32,6 +32,11 @@ uint32_t control_data_len(int actual_num_bytes_with_setup, uint32_t requested);
 // longer reply makes Linux vhci drop the connection).
 uint32_t control_in_reply_len(uint32_t data_len, uint16_t wLength, uint32_t transfer_buffer_length);
 
+// Non-control IN: the transfer is submitted with its length rounded up to MPS (ESP-IDF requires
+// it), so the device can deliver more than the client asked for. True if it did; the result is then
+// the first `requested` bytes with status -EOVERFLOW, as a Linux HCD reports babble.
+bool in_overflow(int actual_num_bytes, uint32_t requested);
+
 // Control OUT (host-to-device data stage): the device gets exactly wLength bytes taken from the
 // CMD_SUBMIT payload, so wLength, transfer_buffer_length and the payload length actually received
 // must all be equal (Linux usb_submit_urb refuses wLength != transfer_buffer_length with -EBADR).
