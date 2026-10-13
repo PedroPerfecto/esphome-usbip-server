@@ -575,9 +575,11 @@ void USBIPServer::dump_config() {
                 "  Max transfer size: %u\n"
                 "  DMA chunk size: %u\n"
                 "  Max pending: %u\n"
-                "  Interrupt queue depth: %u",
+                "  Interrupt queue depth: %u\n"
+                "  Out-stuck timeout: %u ms",
                 this->port_, this->busid_.c_str(), (unsigned) this->max_transfer_size_,
-                (unsigned) this->dma_chunk_size_, this->max_pending_, this->interrupt_queue_depth_);
+                (unsigned) this->dma_chunk_size_, this->max_pending_, this->interrupt_queue_depth_,
+                (unsigned) this->out_stuck_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  TCP listening: %s", this->tcp_listening_.load() ? "YES" : "NO");
   usbip::DeviceInfo d;
   bool busy = false;

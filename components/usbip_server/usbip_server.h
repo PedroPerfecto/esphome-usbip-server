@@ -96,6 +96,7 @@ class USBIPServer : public usb_host::USBClient {
   void set_dma_chunk_size(uint32_t size) { this->dma_chunk_size_ = size; }
   void set_interface_mask(uint32_t mask) { this->interface_mask_ = mask; }
   void set_interrupt_queue_depth(uint16_t depth) { this->interrupt_queue_depth_ = depth; }
+  void set_out_stuck_timeout(uint32_t ms) { this->out_stuck_timeout_ms_ = ms; }
 
  protected:
   // Pending URB. Only the TCP task modifies it; the USB task only posts the index to the queue.

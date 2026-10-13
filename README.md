@@ -84,6 +84,8 @@ instead of `@main` for a node you depend on.
 | `max_transfer_size` | `131072` | 64-1048576 | Largest single transfer accepted from the client, in bytes; larger requests fail with `-EPIPE` |
 | `dma_chunk_size` | `16384` | 64-65536 | Largest single USB transfer, in bytes. Bulk transfers above it are split into chunks of this size (rounded down to a multiple of the endpoint's max packet size); interrupt transfers and control requests (`wLength`) above it fail with `-EPIPE` |
 | `max_pending` | `16` | 1-32 | Maximum transfers in flight at once |
+| `interrupt_queue_depth` | `32` | 4-4096 | Packets stored per interrupt IN endpoint (one entry = one packet of at most the endpoint's max packet size; storage in PSRAM if available) |
+| `out_stuck_timeout` | `3s` | 1s-60s | Stuck detector: an interrupt OUT transfer in flight this long without a completion, or an unlinked/abandoned transfer still in flight this long after it was asked to end, is recorded (`OUT_STUCK`, shown by the `lock_diag` text sensor after the restart) and the device reboots; after 3 such reboots within an hour of run time it only reports (`OUT_STUCK_SUPPRESSED`) |
 | `interfaces` | all | 0-31, at least one | List of `bInterfaceNumber` values to export |
 
 ### Exporting selected interfaces
