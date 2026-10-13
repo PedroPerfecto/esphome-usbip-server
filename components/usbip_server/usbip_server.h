@@ -10,6 +10,7 @@
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
+#include "usbip_bulkq.h"
 #include "usbip_chunk.h"
 #include "usbip_device.h"
 #include "usbip_endpoints.h"
@@ -116,6 +117,7 @@ class USBIPServer : public usb_host::USBClient {
     bool orphan{false};          // connection ended, just release
     bool unlink_pending{false};  // client sent CMD_UNLINK, reply with RET_UNLINK
     bool chunked{false};         // large bulk transfer split into chunks
+    bool waiting{false};         // bulk: prepared but not submitted yet, in bulk_order_ (no done_queue_ entry)
     uint8_t *big_buf{nullptr};   // chunked: all data in PSRAM (IN result / OUT source)
     usbip::ChunkPlan plan;       // chunked: split state
   };
@@ -137,6 +139,11 @@ class USBIPServer : public usb_host::USBClient {
   static void configure_session_socket_(int sock);
   bool handle_submit_(int sock, const usbip::Message &m);
   bool handle_data_submit_(int sock, const usbip::Message &m);
+  // Submits a prepared bulk/interrupt OUT slot to the device. On failure frees the slot and answers
+  // -EPIPE; returns false only if that send failed.
+  bool start_data_transfer_(int sock, PendingSlot &slot);
+  // Submits the waiting bulk transfers whose endpoint got free (bulk_order_), oldest first.
+  bool pump_bulk_(int sock);
   esp_err_t submit_locked_(usb_transfer_t *x, bool is_control);  // submits under dev_lock_
   void cancel_endpoint_(uint8_t ep_addr);                        // halt + flush + clear
   void note_request_size_(uint32_t size);
@@ -284,6 +291,9 @@ class USBIPServer : public usb_host::USBClient {
   };
 
   PendingSlot slots_[MAX_PENDING_LIMIT];
+  // Bulk transfers held back while a chunked transfer is in progress on their endpoint (ids = slot
+  // indices, see usbip_bulkq.h). TCP task only.
+  usbip::BulkOrder bulk_order_;
   QueueHandle_t done_queue_{nullptr};
   uint8_t *rx_payload_{nullptr};
   uint32_t max_seen_request_{0};

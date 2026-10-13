@@ -656,7 +656,9 @@ void USBIPServer::free_slot_(PendingSlot &slot) {
   if (slot.big_buf != nullptr) free(slot.big_buf);  // NOLINT
   slot.big_buf = nullptr;
   slot.chunked = false;
+  slot.waiting = false;
   slot.used = false;
+  this->bulk_order_.forget(slot.index);  // bulk: unblocks the endpoint / leaves the FIFO; no-op otherwise
 }
 
 void USBIPServer::tcp_task_loop_() {
@@ -1076,21 +1078,62 @@ bool USBIPServer::handle_data_submit_(int sock, const usbip::Message &m) {
              e.type == usbip::kEpTypeBulk ? "BULK" : "INTR", addr, (unsigned) requested, (unsigned) num_bytes);
   }
 
-  // Interrupt OUT in flight (on_disconnected waits for it): counted before the submit, the callback decrements.
-  if (slot->is_intr) this->intr_out_in_flight_.fetch_add(1, std::memory_order_relaxed);
-  esp_err_t err = this->submit_locked_(x, false);
-  if (err != ESP_OK) {
-    if (slot->is_intr) this->intr_out_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-    this->free_slot_(*slot);
-    ESP_LOGW(TAG, "seq %u: ep %02X submit failed: %s -> -EPIPE", (unsigned) seq, addr, esp_err_to_name(err));
-    return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  // Bulk: a chunked transfer is sent as several USB transfers, each submitted after the previous one
+  // completed. Anything submitted to the same endpoint meanwhile would reach the device in between,
+  // so it waits (prepared, with its data) until the chunked transfer finished completely.
+  if (!slot->is_intr) {
+    switch (this->bulk_order_.add(slot->index, addr, chunked)) {
+      case usbip::BulkAdd::kSubmitNow:
+        break;
+      case usbip::BulkAdd::kQueued:
+        slot->waiting = true;
+        ESP_LOGV(TAG, "seq %u: ep %02X busy with a chunked transfer -> waiting (%u queued)", (unsigned) seq, addr,
+                 this->bulk_order_.waiting_on(addr));
+        return true;
+      case usbip::BulkAdd::kFull:  // not reachable: the FIFO holds as many transfers as there are slots
+        this->free_slot_(*slot);
+        ESP_LOGW(TAG, "seq %u: ep %02X bulk FIFO full -> -EPIPE", (unsigned) seq, addr);
+        return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+    }
   }
-  if (dir_in) {
+  return this->start_data_transfer_(sock, *slot);
+}
+
+bool USBIPServer::start_data_transfer_(int sock, PendingSlot &slot) {
+  slot.waiting = false;
+  // Interrupt OUT in flight (on_disconnected waits for it): counted before the submit, the callback decrements.
+  if (slot.is_intr) this->intr_out_in_flight_.fetch_add(1, std::memory_order_relaxed);
+  esp_err_t err = this->submit_locked_(slot.xfer, false);
+  if (err != ESP_OK) {
+    if (slot.is_intr) this->intr_out_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    const uint32_t seq = slot.seqnum;
+    const uint32_t start_frame = slot.start_frame;
+    const uint32_t number_of_packets = slot.number_of_packets;
+    ESP_LOGW(TAG, "seq %u: ep %02X submit failed: %s -> -EPIPE", (unsigned) seq, slot.ep_addr, esp_err_to_name(err));
+    this->free_slot_(slot);
+    return send_ret_submit_(sock, seq, start_frame, number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+  if (slot.dir_in) {
     this->in_submitted_.fetch_add(1, std::memory_order_relaxed);
   } else {
     this->out_submitted_.fetch_add(1, std::memory_order_relaxed);
   }
   return true;
+}
+
+bool USBIPServer::pump_bulk_(int sock) {
+  bool ok = true;
+  uint8_t id = 0;
+  while (ok && this->bulk_order_.next_ready(&id)) {
+    PendingSlot &s = this->slots_[id];
+    if (!s.used || !s.waiting || s.xfer == nullptr) {  // not expected: free_slot_ removes the entry
+      this->bulk_order_.forget(id);
+      continue;
+    }
+    ESP_LOGV(TAG, "seq %u: ep %02X free -> submitted from the bulk FIFO", (unsigned) s.seqnum, s.ep_addr);
+    ok = this->start_data_transfer_(sock, s);  // a failed submit frees the slot: the loop goes on with the next
+  }
+  return ok;
 }
 
 bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
@@ -1239,6 +1282,14 @@ bool USBIPServer::handle_unlink_(int sock, const usbip::Message &m) {
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
     PendingSlot &s = this->slots_[i];
     if (s.used && !s.orphan && s.seqnum == target) {
+      if (s.waiting) {
+        // Bulk transfer still in the endpoint FIFO: it was never submitted, so there is nothing to
+        // cancel on the device. Drop it (free_slot_ takes it out of bulk_order_) and confirm; no
+        // RET_SUBMIT can follow. The transfers in front of and behind it are not touched.
+        ESP_LOGV(TAG, "UNLINK seq %u (bulk ep %02X, waiting) -> RET_UNLINK", (unsigned) target, s.ep_addr);
+        this->free_slot_(s);
+        return send_ret_unlink_(sock, m.unlink.base.seqnum, usbip::kLinuxECONNRESET);
+      }
       s.unlink_pending = true;
       s.unlink_seqnum = m.unlink.base.seqnum;
       if (s.is_control) {
@@ -1409,6 +1460,9 @@ bool USBIPServer::drain_completions_(int sock) {
     }
     this->free_slot_(s);
   }
+  // Slots freed above may have ended a chunked transfer: submit what waited behind it. Not after a
+  // failed send or without a client (the session is ending; end_session_ releases the waiting slots).
+  if (ok && sock >= 0) ok = this->pump_bulk_(sock);
   return ok;
 }
 
@@ -1422,6 +1476,8 @@ void USBIPServer::end_session_() {
   }
   uint8_t pending = 0;
   for (uint8_t i = 0; i < this->max_pending_; ++i) {
+    // Bulk transfers still waiting in the endpoint FIFO were never submitted: just release them.
+    if (this->slots_[i].used && this->slots_[i].waiting) this->free_slot_(this->slots_[i]);
     if (this->slots_[i].used) {
       this->slots_[i].orphan = true;
       ++pending;
