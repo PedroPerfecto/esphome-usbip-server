@@ -22,6 +22,9 @@ static constexpr uint32_t TCP_TASK_STACK_SIZE = 6144;
 static constexpr UBaseType_t TCP_TASK_PRIORITY = 4;  // below the USB task (5), above the main loop
 static constexpr uint32_t SELECT_TIMEOUT_US = 2000;
 static constexpr uint32_t SESSION_DRAIN_TIMEOUT_MS = 2000;
+// A connection that arrives during a session must deliver its whole request within this time
+// (the TCP task serves nothing else meanwhile).
+static constexpr int64_t SIDE_REQUEST_TIMEOUT_US = 2000 * 1000;
 static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 // on_connected/on_disconnected (main loop) leave a record if dev_lock_ is not free after this long.
 static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
@@ -737,9 +740,16 @@ void USBIPServer::configure_session_socket_(int sock) {
   setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
-// Reads exactly len bytes (timeout per the socket SO_RCVTIMEO).
-static bool recv_exact(int sock, uint8_t *buf, size_t len) {
+// Reads exactly len bytes, all of them before deadline_us (esp_timer_get_time): the time left goes
+// into SO_RCVTIMEO before every recv, so a client sending byte by byte cannot stretch the total.
+static bool recv_exact_before(int sock, uint8_t *buf, size_t len, int64_t deadline_us) {
   while (len > 0) {
+    uint32_t ms = 0;
+    if (!usbip::recv_timeout_before(esp_timer_get_time(), deadline_us, &ms)) return false;
+    struct timeval tv {};
+    tv.tv_sec = static_cast<time_t>(ms / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((ms % 1000) * 1000);
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) return false;
     int n = recv(sock, buf, len, 0);
     if (n <= 0) return false;
     buf += n;
@@ -755,12 +765,13 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
   if (s < 0) return -1;
   char ip[16];
   inet_ntoa_r(client.sin_addr, ip, sizeof(ip));
-  struct timeval tv {};
-  tv.tv_sec = 1;  // short timeout so a slow client cannot block us
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  // One limit for the whole request (header and import body), so a slow client cannot block us.
+  const int64_t deadline = esp_timer_get_time() + SIDE_REQUEST_TIMEOUT_US;
 
   uint8_t hdr[usbip::kOpHeaderSize];
-  if (!recv_exact(s, hdr, sizeof(hdr))) {
+  if (!recv_exact_before(s, hdr, sizeof(hdr), deadline)) {
+    ESP_LOGW(TAG, "Client %s: no complete request within %u ms during active session, closed", ip,
+             (unsigned) (SIDE_REQUEST_TIMEOUT_US / 1000));
     close(s);
     return -1;
   }
@@ -778,8 +789,8 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
   }
   uint8_t raw_busid[usbip::kBusIdSize];
   char busid[usbip::kBusIdSize];
-  if (op.version == usbip::kVersion && op.code == usbip::kOpReqImport && recv_exact(s, raw_busid, sizeof(raw_busid)) &&
-      usbip::decode_req_import_busid(raw_busid, busid)) {
+  if (op.version == usbip::kVersion && op.code == usbip::kOpReqImport &&
+      recv_exact_before(s, raw_busid, sizeof(raw_busid), deadline) && usbip::decode_req_import_busid(raw_busid, busid)) {
     // Only an import that would succeed may end the running session. Anything else is answered
     // here and the session (and import_count_, client_addr_) stays untouched.
     const bool ready = this->device_ready_();
@@ -795,7 +806,7 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
     }
     memcpy(busid_out, busid, usbip::kBusIdSize);
     ESP_LOGW(TAG, "Client %s: OP_REQ_IMPORT '%s' takes over the active session", ip, busid_out);
-    tv.tv_sec = 0;  // back to reading without a timeout (the session uses select)
+    struct timeval tv {};  // back to reading without a timeout (the session uses select)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     configure_session_socket_(s);
     return s;
