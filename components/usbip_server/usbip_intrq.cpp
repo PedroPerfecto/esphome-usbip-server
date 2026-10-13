@@ -215,6 +215,12 @@ void IntrInQueue::complete_front(const IntrServePlan &plan, uint8_t *out) {
   this->waiting_.pop_front();
 }
 
+bool IntrInQueue::on_completion(const uint8_t *data, int actual_num_bytes) {
+  if (actual_num_bytes <= 0) return this->ring_.push(nullptr, 0);
+  const uint16_t mps = this->ring_.mps();
+  return this->ring_.push(data, actual_num_bytes > mps ? mps : static_cast<uint16_t>(actual_num_bytes));
+}
+
 bool IntrInQueue::should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms,
                                   uint16_t reserved) const {
   const bool full = static_cast<uint32_t>(this->ring_.size()) + reserved >= this->ring_.depth();

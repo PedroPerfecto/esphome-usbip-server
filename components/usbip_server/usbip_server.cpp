@@ -491,7 +491,7 @@ void USBIPServer::publish_diag_() {
       this->intr_unlink_waiting_.load(std::memory_order_relaxed),
       this->out_unlink_wait_timeout_.load(std::memory_order_relaxed),
       this->intr_overflow_.load(std::memory_order_relaxed),
-      this->intr_zlp_dropped_.load(std::memory_order_relaxed),
+      this->intr_zlp_.load(std::memory_order_relaxed),
       this->out_stuck_detected_.load(std::memory_order_relaxed),
       this->unlink_orphaned_.load(std::memory_order_relaxed),
   };
@@ -501,7 +501,7 @@ void USBIPServer::publish_diag_() {
       "unlink_discarded", "in_resubmitted", "in_send_failed", "cb_queue_full",
       "dev_lock_hold_max_us",
       "intr_q_depth_max", "intr_q_full", "intr_dropped_nosession", "intr_flushed_import", "intr_unlink_waiting",
-      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp_dropped", "out_stuck_detected", "unlink_orphaned",
+      "out_unlink_wait_timeout", "intr_overflow", "intr_zlp", "out_stuck_detected", "unlink_orphaned",
   };
   bool any_changed = false;
   for (size_t i = 0; i < DIAG_COUNT; ++i) {
@@ -526,7 +526,7 @@ void USBIPServer::publish_diag_() {
       this->cb_queue_full_sensor_,     this->dev_lock_hold_max_sensor_,
       this->intr_q_depth_max_sensor_,  this->intr_q_full_sensor_,  this->intr_dropped_nosession_sensor_,
       this->intr_flushed_import_sensor_, this->intr_unlink_waiting_sensor_, this->out_unlink_wait_timeout_sensor_,
-      this->intr_overflow_sensor_,     this->intr_zlp_dropped_sensor_,
+      this->intr_overflow_sensor_,     this->intr_zlp_sensor_,
       nullptr,  // out_stuck_detected: log only
       nullptr,  // unlink_orphaned: log only
   };
@@ -2036,20 +2036,21 @@ bool USBIPServer::handle_prefetch_done_(int sock, uint8_t pf_index) {
   bool ok = true;
   switch (x->status) {
     case USB_TRANSFER_STATUS_COMPLETED:
+      // A 0 B completion is a zero-length packet: stored like any other packet (entry of length 0), it
+      // ends the request being assembled as a short packet does.
       if (x->actual_num_bytes > 0) {
         this->in_done_data_.fetch_add(1, std::memory_order_relaxed);
-        const uint16_t len = static_cast<uint16_t>(std::min<int>(x->actual_num_bytes, ep.mps));
-        if (!this->intr_session_) {
-          this->intr_dropped_nosession_.fetch_add(1, std::memory_order_relaxed);
-        } else if (!ep.q.on_packet(x->data_buffer, len)) {
-          // Should not happen: pump_prefetch_ reserves a ring entry for every transfer in flight.
-          this->intr_q_full_.fetch_add(1, std::memory_order_relaxed);
-          ESP_LOGW(TAG, "Interrupt ep %02X: ring full, packet dropped", ep.addr);
-        }
       } else {
-        // 0 B completion: not stored (not established that it is always a real zero-length packet).
         this->in_done_empty_.fetch_add(1, std::memory_order_relaxed);
-        this->intr_zlp_dropped_.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (!this->intr_session_) {
+        this->intr_dropped_nosession_.fetch_add(1, std::memory_order_relaxed);
+      } else if (!ep.q.on_completion(x->data_buffer, x->actual_num_bytes)) {
+        // Should not happen: pump_prefetch_ reserves a ring entry for every transfer in flight.
+        this->intr_q_full_.fetch_add(1, std::memory_order_relaxed);
+        ESP_LOGW(TAG, "Interrupt ep %02X: ring full, packet dropped", ep.addr);
+      } else if (x->actual_num_bytes <= 0) {
+        this->intr_zlp_.fetch_add(1, std::memory_order_relaxed);
       }
       break;
     case USB_TRANSFER_STATUS_STALL:

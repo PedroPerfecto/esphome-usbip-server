@@ -86,7 +86,7 @@ class USBIPServer : public usb_host::USBClient {
   SUB_SENSOR(intr_unlink_waiting)
   SUB_SENSOR(out_unlink_wait_timeout)
   SUB_SENSOR(intr_overflow)
-  SUB_SENSOR(intr_zlp_dropped)
+  SUB_SENSOR(intr_zlp)
 #endif
 
   void set_port(uint16_t port) { this->port_ = port; }
@@ -370,7 +370,7 @@ class USBIPServer : public usb_host::USBClient {
   std::atomic<uint32_t> intr_unlink_waiting_{0};     // CMD_UNLINK of a waiting IN request (no USB operation)
   std::atomic<uint32_t> out_unlink_wait_timeout_{0};  // interrupt OUT did not finish 5 s after CMD_UNLINK
   std::atomic<uint32_t> intr_overflow_{0};           // IN request shorter than the packet -> -EOVERFLOW
-  std::atomic<uint32_t> intr_zlp_dropped_{0};        // prefetch completed with 0 B, not stored
+  std::atomic<uint32_t> intr_zlp_{0};        // zero-length packets stored in the ring (prefetch completed with 0 B)
   std::atomic<uint32_t> out_stuck_detected_{0};      // check_out_stuck_: stuck transfer found
   std::atomic<uint32_t> unlink_orphaned_{0};         // control/bulk did not finish 5 s after CMD_UNLINK
 

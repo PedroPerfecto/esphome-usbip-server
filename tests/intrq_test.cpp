@@ -457,3 +457,59 @@ TEST_CASE("ring: failing allocator -> init false, nothing leaks") {
   CHECK_FALSE(r.initialized());
   CHECK(frees == 0);
 }
+
+// ---------------------------------------------------------------- zero-length packet
+
+TEST_CASE("queue: a request longer than MPS is ended by a zero-length packet") {
+  // Report of exactly 64 B (= MPS) read with a 128 B request: the device marks the end with a
+  // zero-length packet. Without storing it the request would wait for a second data packet.
+  IntrInQueue q;
+  REQUIRE(q.init(8, 64));
+  REQUIRE(q.add_request(7, 128, 0));
+  const auto full = pkt(64, 0x5A);
+  REQUIRE(q.on_completion(full.data(), 64));
+  uint32_t seq = 0;
+  IntrServePlan plan;
+  CHECK_FALSE(q.front_ready(&seq, &plan));  // full packet, room left: keeps waiting
+
+  CHECK(q.on_completion(full.data(), 0));  // zero-length packet (the buffer content is irrelevant)
+  CHECK(q.ring().size() == 2);
+  CHECK(q.ring().len_at(1) == 0);
+  REQUIRE(q.front_ready(&seq, &plan));
+  CHECK(seq == 7);
+  CHECK(plan.short_packet);
+  CHECK(plan.length == 64);
+  CHECK(plan.packets == 2);  // the zero-length packet is consumed with it
+  uint8_t out[128] = {0};
+  q.complete_front(plan, out);
+  CHECK(out[63] == 0x5A);
+  CHECK(q.ring().empty());
+  CHECK(q.waiting().empty());
+}
+
+TEST_CASE("queue: a zero-length packet alone completes a request with 0 bytes") {
+  IntrInQueue q;
+  REQUIRE(q.init(8, 64));
+  REQUIRE(q.add_request(1, 64, 0));
+  CHECK(q.on_completion(nullptr, 0));
+  uint32_t seq = 0;
+  IntrServePlan plan;
+  REQUIRE(q.front_ready(&seq, &plan));
+  CHECK(plan.short_packet);
+  CHECK(plan.length == 0);
+  CHECK(plan.packets == 1);
+}
+
+TEST_CASE("queue: on_completion cuts to MPS and reports a full ring") {
+  IntrInQueue q;
+  REQUIRE(q.init(4, 8));
+  const auto big = pkt(16, 0x11);
+  CHECK(q.on_completion(big.data(), 16));
+  CHECK(q.ring().len_at(0) == 8);
+  CHECK(q.on_completion(big.data(), 3));
+  CHECK(q.ring().len_at(1) == 3);
+  CHECK(q.on_completion(nullptr, -1));  // treated as a zero-length packet
+  CHECK(q.ring().len_at(2) == 0);
+  CHECK(q.on_completion(big.data(), 8));
+  CHECK_FALSE(q.on_completion(nullptr, 0));  // full: also a zero-length packet needs an entry
+}

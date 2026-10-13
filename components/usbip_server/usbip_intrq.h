@@ -160,6 +160,11 @@ class IntrInQueue {
   bool unlink(uint32_t seqnum) { return this->waiting_.remove(seqnum); }
   // Received packet from a prefetch transfer; false if the ring is full (packet dropped).
   bool on_packet(const uint8_t *data, uint16_t len) { return this->ring_.push(data, len); }
+  // Successful completion of a prefetch transfer with actual_num_bytes as the USB stack reports it.
+  // More than MPS is cut to MPS; 0 (or less) is a zero-length packet and is stored as an entry of
+  // length 0: for the request being assembled it is a short packet, i.e. its end. false if the ring
+  // is full.
+  bool on_completion(const uint8_t *data, int actual_num_bytes);
 
   // The oldest waiting request, if it can be completed now. On true, *seqnum and *plan describe it;
   // call complete_front() with a buffer of plan->length bytes to apply it.

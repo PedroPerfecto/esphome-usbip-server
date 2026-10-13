@@ -39,7 +39,7 @@ CONF_INTR_FLUSHED_IMPORT = "intr_flushed_import"
 CONF_INTR_UNLINK_WAITING = "intr_unlink_waiting"
 CONF_OUT_UNLINK_WAIT_TIMEOUT = "out_unlink_wait_timeout"
 CONF_INTR_OVERFLOW = "intr_overflow"
-CONF_INTR_ZLP_DROPPED = "intr_zlp_dropped"
+CONF_INTR_ZLP = "intr_zlp"
 
 _DIAG_COUNTERS = (
     CONF_IN_SUBMITTED,
@@ -64,7 +64,7 @@ _DIAG_COUNTERS = (
     CONF_INTR_UNLINK_WAITING,
     CONF_OUT_UNLINK_WAIT_TIMEOUT,
     CONF_INTR_OVERFLOW,
-    CONF_INTR_ZLP_DROPPED,
+    CONF_INTR_ZLP,
 )
 
 # Longest dev_lock_ hold around the usb_host_* calls within the last diag period (10 s).
