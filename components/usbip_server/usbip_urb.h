@@ -27,4 +27,10 @@ SetupInfo parse_setup(const uint8_t setup[kSetupPacketSize]);
 // to the range 0..requested.
 uint32_t control_data_len(int actual_num_bytes_with_setup, uint32_t requested);
 
+// Control OUT (host-to-device data stage): the device gets exactly wLength bytes taken from the
+// CMD_SUBMIT payload, so wLength, transfer_buffer_length and the payload length actually received
+// must all be equal (Linux usb_submit_urb refuses wLength != transfer_buffer_length with -EBADR).
+// payload_len is 0 when no payload came with the command.
+bool control_out_lengths_ok(uint16_t wLength, uint32_t transfer_buffer_length, uint32_t payload_len);
+
 }  // namespace usbip

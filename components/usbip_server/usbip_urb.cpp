@@ -15,4 +15,8 @@ uint32_t control_data_len(int actual_num_bytes_with_setup, uint32_t requested) {
   return data > requested ? requested : data;
 }
 
+bool control_out_lengths_ok(uint16_t wLength, uint32_t transfer_buffer_length, uint32_t payload_len) {
+  return wLength == transfer_buffer_length && wLength == payload_len;
+}
+
 }  // namespace usbip

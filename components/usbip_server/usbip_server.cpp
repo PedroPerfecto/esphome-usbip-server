@@ -1101,6 +1101,15 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
     }
   }
 
+  // Control OUT: the data stage is wLength bytes of the payload. On a mismatch part of it would be
+  // uninitialised buffer content (wLength larger) or silently cut off (wLength smaller): refuse, and
+  // send nothing to the device. Checked before the requests answered locally as well.
+  if (!si.dir_in && !usbip::control_out_lengths_ok(si.wLength, c.transfer_buffer_length, m.payload_len)) {
+    ESP_LOGW(TAG, "seq %u: control OUT wLength %u != transfer_buffer_length %u / payload %u -> -EPIPE",
+             (unsigned) seq, si.wLength, (unsigned) c.transfer_buffer_length, (unsigned) m.payload_len);
+    return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
+  }
+
   uint8_t clear_halt_ep = 0;
   switch (a.kind) {
     case usbip::ControlKind::kSetConfiguration: {
@@ -1154,8 +1163,9 @@ bool USBIPServer::handle_submit_(int sock, const usbip::Message &m) {
     return send_ret_submit_(sock, seq, c.start_frame, c.number_of_packets, usbip::kLinuxEPIPE, 0, nullptr);
   }
   memcpy(x->data_buffer, c.setup, usbip::kSetupPacketSize);
+  // OUT: payload_len == wLength (checked above).
   if (!si.dir_in && si.wLength > 0 && m.payload != nullptr) {
-    memcpy(x->data_buffer + usbip::kSetupPacketSize, m.payload, std::min<uint32_t>(m.payload_len, si.wLength));
+    memcpy(x->data_buffer + usbip::kSetupPacketSize, m.payload, si.wLength);
   }
   x->num_bytes = static_cast<int>(size);
   x->bEndpointAddress = 0;
