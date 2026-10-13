@@ -156,13 +156,48 @@ This produces hundreds of lines per second under load.
   control request classification, chunking, interface filtering) are plain C++
   without ESPHome dependencies and are unit tested on the host:
   `make -C tests test`.
-- ESP-IDF cannot cancel a single transfer. An unlink halts, flushes and clears
-  the whole endpoint; other transfers cancelled as a side effect are submitted
-  again. Control transfers on endpoint 0 cannot be cancelled and are completed.
+- ESP-IDF cannot cancel a single transfer. An unlink on a bulk endpoint halts,
+  flushes and clears the whole endpoint; other transfers cancelled as a side
+  effect are submitted again (see Known limitations). Interrupt endpoints are
+  never halted: interrupt IN is served from packets the server prefetches into
+  a queue, so an unlink only drops the waiting request; interrupt OUT and
+  control transfers cannot be cancelled and are waited for. Every unlink is
+  answered within 5 s, with the completion or without it.
 - A zero-length packet is added only when the client sets `URB_ZERO_PACKET`,
   matching Linux behaviour.
 - `SET_CONFIGURATION` for the active configuration is answered locally, as the
   Linux USB/IP host driver does.
+
+## Known limitations
+
+- **Bulk unlink is not exact; bulk and Mass Storage are experimental.**
+  Cancelling one bulk transfer cancels every transfer on that endpoint. The
+  others are submitted again from their start: ESP-IDF reports 0 bytes for a
+  cancelled transfer, so packets of a multi-packet OUT transfer that were
+  already sent reach the device twice, and packets of an IN transfer that were
+  already received are lost. A transfer the client submits right after the
+  unlink can also be sent before the cancelled ones are resubmitted, i.e. out
+  of order. Clients that never unlink bulk transfers in the middle of a data
+  stream are not affected. Interrupt (HID) devices are the tested use case.
+- **A silent stop of the periodic transfers is only detected through
+  interrupt OUT.** The stuck detector (`out_stuck_timeout`) sees an interrupt
+  OUT transfer that does not complete, or an unlinked/abandoned transfer that
+  stays in flight. If the USB stack stops completing interrupt IN transfers
+  and the client sends nothing to the device, this looks the same as a device
+  with nothing to report and is not detected.
+- **A second connection can delay the running session by up to 2 s.** While a
+  session is active, a new TCP connection (device list, or an import that takes
+  the device over) is read in the same task; until its request is complete, or
+  2 s have passed, the active session is not served. Anything on the network
+  that keeps opening connections without sending a request slows the session
+  down accordingly. There is no authentication (see Security).
+- **Interrupt IN packets received between sessions are dropped.** Up to two
+  prefetch transfers per interrupt IN endpoint stay in flight after a session
+  ends. A packet they receive then is acknowledged to the device but has no
+  client to go to; packets still queued are dropped at the next import. A
+  client must not rely on reports the device sent while no client was attached.
+- **More than four interrupt IN endpoints** (among the exported interfaces)
+  are not served; requests to the others fail with `-EPIPE`.
 
 ## License
 
