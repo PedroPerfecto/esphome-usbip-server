@@ -225,9 +225,11 @@ class USBIPServer : public usb_host::USBClient {
   static void probe_cb_(usb_transfer_t *xfer);  // USB task
   // Main loop only. Store a record of a long dev_lock_ wait in RTC_NOINIT memory (survives the
   // reboot that follows), see usbip_server.cpp.
-  void record_lock_event_(uint8_t kind);
-  // Main loop only: dev_lock_ Take that leaves a record after LOOP_LOCK_WARN_MS, then waits as before.
-  void take_dev_lock_from_loop_(uint8_t kind);
+  void record_lock_event_(uint8_t kind, bool gave_up = false);
+  // Main loop only: dev_lock_ Take that leaves a record after LOOP_LOCK_WARN_MS and waits at most
+  // LOOP_LOCK_GIVEUP_MS more. Still busy then: the record gets reason=timeout, the device restarts
+  // and false is returned (the caller must not touch what the lock guards).
+  bool take_dev_lock_from_loop_(uint8_t kind);
   void load_lock_diag_();  // setup(): report and clear the record left by the previous boot
   void load_reboot_guard_();  // setup(): validate the OUT_STUCK reboot guard (RTC_NOINIT) and count this boot
   void release_interfaces_();

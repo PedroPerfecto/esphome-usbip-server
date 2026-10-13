@@ -28,6 +28,10 @@ static constexpr int64_t SIDE_REQUEST_TIMEOUT_US = 2000 * 1000;
 static constexpr uint32_t DUMP_CONFIG_LOCK_TIMEOUT_MS = 100;
 // on_connected/on_disconnected (main loop) leave a record if dev_lock_ is not free after this long.
 static constexpr uint32_t LOOP_LOCK_WARN_MS = 1000;
+// ... and give up (record with reason=timeout, restart) if it is still not free this much later. The
+// main loop must not wait forever: its watchdogs (check_lock_watchdog_) run in the same task, and the
+// task watchdog (5 s) would otherwise end it with a panic.
+static constexpr uint32_t LOOP_LOCK_GIVEUP_MS = 2000;
 // A usb_host_* section (submit/cancel/clear) holding dev_lock_ this long is considered hung.
 static constexpr uint32_t LOCK_WATCHDOG_US = 10u * 1000u * 1000u;
 // After CMD_UNLINK of a transfer in flight: RET_UNLINK at the latest after this long, then the slot is
@@ -87,7 +91,7 @@ struct LockDiagRecord {
   uint32_t magic;
   uint8_t kind;
   uint8_t site;  // USBIPServer::LockSite, 0 = no tracked section holding the lock (KIND_OUT_STUCK: endpoint)
-  uint16_t reserved;  // 0 (KIND_OUT_STUCK: usbip::out_stuck_pack)
+  uint16_t reserved;  // 0; KIND_*_WAIT: 1 = gave up and restarted; KIND_OUT_STUCK*: usbip::out_stuck_pack
   uint32_t held_ms;
   uint32_t uptime_ms;
 };
@@ -188,8 +192,10 @@ void USBIPServer::load_lock_diag_() {
     }
   } else if (rec.magic == LOCK_DIAG_MAGIC && rec.kind >= KIND_WATCHDOG_REBOOT && rec.kind <= KIND_INTR_SETUP_STUCK &&
              rec.site <= static_cast<uint8_t>(LockSite::CLEAR)) {
-    snprintf(text, sizeof(text), "%s site=%s held=%u ms uptime=%u ms", lock_diag_kind_str(rec.kind),
-             lock_site_str_(rec.site), (unsigned) rec.held_ms, (unsigned) rec.uptime_ms);
+    const bool gave_up = (rec.kind == KIND_CONNECT_WAIT || rec.kind == KIND_DISCONNECT_WAIT) && rec.reserved == 1;
+    snprintf(text, sizeof(text), "%s site=%s held=%u ms%s uptime=%u ms", lock_diag_kind_str(rec.kind),
+             lock_site_str_(rec.site), (unsigned) rec.held_ms, gave_up ? " reason=timeout" : "",
+             (unsigned) rec.uptime_ms);
     ESP_LOGE(TAG, "Previous boot left a dev_lock_ record: %s", text);
   }
   s_lock_diag.magic = 0;
@@ -214,7 +220,7 @@ void USBIPServer::load_reboot_guard_() {
   }
 }
 
-void USBIPServer::record_lock_event_(uint8_t kind) {
+void USBIPServer::record_lock_event_(uint8_t kind, bool gave_up) {
   const uint32_t since = this->lock_since_us_.load(std::memory_order_acquire);
   uint8_t site = 0;
   uint32_t held_ms = 0;
@@ -222,15 +228,20 @@ void USBIPServer::record_lock_event_(uint8_t kind) {
     site = this->lock_site_.load(std::memory_order_relaxed);
     held_ms = (lock_clock_us_() - since) / 1000;
   }
-  store_lock_diag(kind, site, held_ms);
-  ESP_LOGE(TAG, "dev_lock_ busy: %s site=%s held=%u ms", lock_diag_kind_str(kind), lock_site_str_(site),
-           (unsigned) held_ms);
+  store_lock_diag(kind, site, held_ms, gave_up ? 1 : 0);
+  ESP_LOGE(TAG, "dev_lock_ busy: %s site=%s held=%u ms%s", lock_diag_kind_str(kind), lock_site_str_(site),
+           (unsigned) held_ms, gave_up ? ", giving up -> rebooting" : "");
 }
 
-void USBIPServer::take_dev_lock_from_loop_(uint8_t kind) {
-  if (xSemaphoreTake(this->dev_lock_, pdMS_TO_TICKS(LOOP_LOCK_WARN_MS)) == pdTRUE) return;
+bool USBIPServer::take_dev_lock_from_loop_(uint8_t kind) {
+  if (xSemaphoreTake(this->dev_lock_, pdMS_TO_TICKS(LOOP_LOCK_WARN_MS)) == pdTRUE) return true;
   this->record_lock_event_(kind);
-  xSemaphoreTake(this->dev_lock_, portMAX_DELAY);
+  if (xSemaphoreTake(this->dev_lock_, pdMS_TO_TICKS(LOOP_LOCK_GIVEUP_MS)) == pdTRUE) return true;
+  // The holder (TCP task in a usb_host_* call, most likely) is not coming back. Written last:
+  // safe_reboot() is the point of no return, the record is what the next boot reports.
+  this->record_lock_event_(kind, true);
+  App.safe_reboot();
+  return false;
 }
 
 const char *USBIPServer::lock_site_str_(uint8_t site) {
@@ -666,7 +677,7 @@ void USBIPServer::on_connected() {
   if (filtered_len > 0)
     ESP_LOGI(TAG, "Interface filter: exporting %u of %u interfaces", d.bNumInterfaces, cfg_desc->bNumInterfaces);
 
-  this->take_dev_lock_from_loop_(KIND_CONNECT_WAIT);
+  if (!this->take_dev_lock_from_loop_(KIND_CONNECT_WAIT)) return;  // restarting
   if (filtered_len > 0) memcpy(this->cfg_filtered_, filtered, filtered_len);
   this->cfg_filtered_len_ = static_cast<uint16_t>(filtered_len);
   this->dev_info_ = d;
@@ -700,7 +711,7 @@ void USBIPServer::release_interfaces_() {
 
 void USBIPServer::on_disconnected() {
   // Stop new transfers first (the TCP task submits under the same lock).
-  this->take_dev_lock_from_loop_(KIND_DISCONNECT_WAIT);
+  if (!this->take_dev_lock_from_loop_(KIND_DISCONNECT_WAIT)) return;  // restarting
   this->dev_ready_ = false;
   this->dev_ready_pub_.store(false, std::memory_order_relaxed);
   xSemaphoreGive(this->dev_lock_);
