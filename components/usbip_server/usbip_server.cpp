@@ -375,7 +375,6 @@ void USBIPServer::check_out_stuck_() {
 
   usbip::OutWatch w;
   w.in_flight = this->intr_out_in_flight_.load(std::memory_order_acquire);
-  if (w.in_flight == 0) return;
   const uint32_t oldest = this->out_watch_oldest_ms_.load(std::memory_order_acquire);
   const uint32_t orphan = this->out_watch_orphan_ms_.load(std::memory_order_acquire);
   w.have_oldest = oldest != 0;
@@ -385,19 +384,17 @@ void USBIPServer::check_out_stuck_() {
   w.orphan_since_ms = orphan;
   w.orphan_ep = this->out_watch_orphan_ep_.load(std::memory_order_relaxed);
   const uint32_t now = now_ms_();
-  const usbip::OutStuck reason = usbip::out_stuck_check(w, now);
-  if (reason == usbip::OutStuck::kNone) return;
+  usbip::OutStuck reason = usbip::out_stuck_check(w, now);
   // Re-check: the transfer may have completed (and another one started) between the reads.
-  if (this->intr_out_in_flight_.load(std::memory_order_acquire) == 0 ||
-      this->out_watch_oldest_ms_.load(std::memory_order_acquire) != oldest ||
-      this->out_watch_orphan_ms_.load(std::memory_order_acquire) != orphan) {
-    return;
+  if (reason != usbip::OutStuck::kNone &&
+      (this->intr_out_in_flight_.load(std::memory_order_acquire) == 0 ||
+       this->out_watch_oldest_ms_.load(std::memory_order_acquire) != oldest ||
+       this->out_watch_orphan_ms_.load(std::memory_order_acquire) != orphan)) {
+    reason = usbip::OutStuck::kNone;
   }
-  if (this->out_stuck_suppressed_) {
-    // Already reported in this boot and not rebooting: the stop goes on.
-    usbip::guard_note_stop(guard);
-    return;
-  }
+  // Nothing stuck: also ends a suppressed stop, so that a later one is reported and judged again.
+  const usbip::StuckStep step = usbip::stuck_step(this->out_stuck_latch_, guard, reason != usbip::OutStuck::kNone);
+  if (step == usbip::StuckStep::kIdle || step == usbip::StuckStep::kQuiet) return;
 
   usbip::OutStuckInfo info;
   info.reason = reason;
@@ -406,7 +403,7 @@ void USBIPServer::check_out_stuck_() {
   const uint32_t pf = this->prefetch_in_flight_.load(std::memory_order_acquire);
   info.prefetch_in_flight = static_cast<uint8_t>(std::min<uint32_t>(pf, 15));
   this->out_stuck_detected_.fetch_add(1, std::memory_order_relaxed);
-  const bool suppress = usbip::guard_on_stuck(guard) == usbip::GuardAction::kSuppress;
+  const bool suppress = step == usbip::StuckStep::kReportSuppressed;
   const uint8_t kind = suppress ? KIND_OUT_STUCK_SUPPRESSED : KIND_OUT_STUCK;
   // Before the probe as well, in case it does not return.
   store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
@@ -417,7 +414,6 @@ void USBIPServer::check_out_stuck_() {
   if (suppress) {
     // Restarting did not help kGuardMaxReboots times within the window: stay up (log, API and OTA
     // remain reachable) and say so. The transfers stay stuck until someone restarts the device.
-    this->out_stuck_suppressed_ = true;
     snprintf(text + n, sizeof(text) - n, " (%u reboots in the last %u s, not rebooting)", usbip::kGuardMaxReboots,
              (unsigned) usbip::kGuardWindowS);
     ESP_LOGE(TAG, "%s, %u interrupt OUT transfer(s) in flight", text, (unsigned) w.in_flight);

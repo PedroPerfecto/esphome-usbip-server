@@ -298,3 +298,65 @@ TEST_CASE("out stuck record: suppressed text") {
   out_stuck_format(info, text, sizeof(text), true);
   CHECK(std::string(text) == "OUT_STUCK_SUPPRESSED ep=01 age=3200 ms reason=age ep0=ok prefetch=2");
 }
+
+// ---------------------------------------------------------------- detector step (latch + guard)
+
+namespace {
+// Guard that has just seen kGuardMaxReboots reboots; the device is up for the given time.
+RebootGuard guard_after_three_reboots(uint32_t uptime_s) {
+  RebootGuard g{};
+  for (int i = 0; i < 3; ++i) REQUIRE(boot_then_stuck(g, 30) == GuardAction::kReboot);
+  guard_boot(g);
+  guard_tick(g, uptime_s);
+  return g;
+}
+}  // namespace
+
+TEST_CASE("stuck step: nothing stuck is idle, a first stop reboots") {
+  RebootGuard g{};
+  StuckLatch latch;
+  guard_boot(g);
+  guard_tick(g, 10);
+  CHECK(stuck_step(latch, g, false) == StuckStep::kIdle);
+  CHECK(stuck_step(latch, g, true) == StuckStep::kReboot);
+  CHECK(g.reboots == 1);
+}
+
+TEST_CASE("stuck step: a suppressed stop is reported once, then quiet while it lasts") {
+  RebootGuard g = guard_after_three_reboots(5);
+  StuckLatch latch;
+  CHECK(stuck_step(latch, g, true) == StuckStep::kReportSuppressed);
+  for (uint32_t t = 6; t < 60; ++t) {
+    guard_tick(g, t);
+    CHECK(stuck_step(latch, g, true) == StuckStep::kQuiet);
+  }
+  CHECK(g.reboots == 3);
+}
+
+TEST_CASE("stuck step: after the suppressed stop went away, a later stop is acted upon again") {
+  // 12 Oct pattern after a harmless first stop: suppressed once (the transfer then completed), the
+  // device runs on for two hours, then transfers get stuck for good. Without dropping the latch
+  // that second stop would never be logged, recorded or answered with a reboot.
+  RebootGuard g = guard_after_three_reboots(5);
+  StuckLatch latch;
+  REQUIRE(stuck_step(latch, g, true) == StuckStep::kReportSuppressed);
+  guard_tick(g, 9);
+  REQUIRE(stuck_step(latch, g, true) == StuckStep::kQuiet);
+  for (uint32_t t = 10; t <= 10 + 2 * 3600; t += 10) {  // transfer completed: nothing stuck
+    guard_tick(g, t);
+    REQUIRE(stuck_step(latch, g, false) == StuckStep::kIdle);
+  }
+  CHECK(g.reboots == 0);  // an hour without a stop
+  guard_tick(g, 10 + 2 * 3600 + 5);
+  CHECK(stuck_step(latch, g, true) == StuckStep::kReboot);
+}
+
+TEST_CASE("stuck step: a new stop within the hour after a suppressed one is reported again, not rebooted") {
+  RebootGuard g = guard_after_three_reboots(5);
+  StuckLatch latch;
+  REQUIRE(stuck_step(latch, g, true) == StuckStep::kReportSuppressed);
+  guard_tick(g, 8);
+  REQUIRE(stuck_step(latch, g, false) == StuckStep::kIdle);
+  guard_tick(g, 300);
+  CHECK(stuck_step(latch, g, true) == StuckStep::kReportSuppressed);  // reported again, guard still holds
+}

@@ -102,4 +102,18 @@ GuardAction guard_on_stuck(RebootGuard &g);
 // Recorded reboots that still lie within the window.
 uint8_t guard_recent_reboots(const RebootGuard &g);
 
+// One periodic check of the detector, combined with the guard. The latch (not kept across boots)
+// makes a suppressed stop be reported once, not every second, and is dropped as soon as nothing is
+// stuck any more, so that a later stop is judged afresh.
+struct StuckLatch {
+  bool suppressed{false};
+};
+enum class StuckStep : uint8_t {
+  kIdle,              // nothing stuck
+  kReboot,            // stuck: record it and restart now
+  kReportSuppressed,  // stuck, but the guard forbids a restart: report it (once)
+  kQuiet,             // still the suppressed stop that was already reported
+};
+StuckStep stuck_step(StuckLatch &latch, RebootGuard &g, bool stuck);
+
 }  // namespace usbip

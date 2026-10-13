@@ -102,4 +102,20 @@ GuardAction guard_on_stuck(RebootGuard &g) {
   return GuardAction::kReboot;
 }
 
+StuckStep stuck_step(StuckLatch &latch, RebootGuard &g, bool stuck) {
+  if (!stuck) {
+    latch.suppressed = false;
+    return StuckStep::kIdle;
+  }
+  if (latch.suppressed) {
+    guard_note_stop(g);
+    return StuckStep::kQuiet;
+  }
+  if (guard_on_stuck(g) == GuardAction::kSuppress) {
+    latch.suppressed = true;
+    return StuckStep::kReportSuppressed;
+  }
+  return StuckStep::kReboot;
+}
+
 }  // namespace usbip
