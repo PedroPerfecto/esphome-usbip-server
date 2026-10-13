@@ -395,3 +395,11 @@ TEST_CASE("stuck step: a new stop within the hour after a suppressed one is repo
   guard_tick(g, 300);
   CHECK(stuck_step(latch, g, true) == StuckStep::kReportSuppressed);  // reported again, guard still holds
 }
+
+TEST_CASE("ep0 probe: sent only for a stuck data endpoint when a reboot follows") {
+  CHECK(ep0_probe_wanted(0x01, true));
+  CHECK(ep0_probe_wanted(0x82, true));
+  CHECK_FALSE(ep0_probe_wanted(0x00, true));   // the stuck transfer is the one on ep0
+  CHECK_FALSE(ep0_probe_wanted(0x01, false));  // suppressed: an unanswered probe would stay on ep0 for good
+  CHECK_FALSE(ep0_probe_wanted(0x00, false));
+}

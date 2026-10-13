@@ -46,6 +46,10 @@ enum class Ep0Probe : uint8_t {
   kSkipped = 4,  // not tried: the stuck transfer is the one on ep0, or no reboot follows
 };
 const char *ep0_probe_str(Ep0Probe r);
+// Whether to send the probe for a stuck transfer on endpoint ep (0 = control). Not if that transfer
+// is the one on ep0 (the probe would only queue behind it), and not if no reboot follows: a probe
+// that gets no answer cannot be cancelled and would stay on ep0, in front of the client's requests.
+bool ep0_probe_wanted(uint8_t ep, bool reboot_follows);
 
 // What the record keeps about one detection.
 struct OutStuckInfo {

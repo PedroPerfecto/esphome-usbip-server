@@ -426,9 +426,8 @@ void USBIPServer::check_out_stuck_() {
   const uint8_t kind = suppress ? KIND_OUT_STUCK_SUPPRESSED : KIND_OUT_STUCK;
   // Before the probe as well, in case it does not return.
   store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
-  // Does the device still answer on ep0? Pointless if the stuck transfer is the one on ep0: the
-  // probe would only queue behind it.
-  info.ep0 = info.ep == 0 ? usbip::Ep0Probe::kSkipped : this->probe_ep0_();
+  // Does the device still answer on ep0? Only asked when it makes sense (ep0_probe_wanted).
+  info.ep0 = usbip::ep0_probe_wanted(info.ep, !suppress) ? this->probe_ep0_() : usbip::Ep0Probe::kSkipped;
   store_lock_diag(kind, info.ep, info.age_ms, usbip::out_stuck_pack(info));
   char text[160];
   const size_t n = usbip::out_stuck_format(info, text, sizeof(text), suppress);

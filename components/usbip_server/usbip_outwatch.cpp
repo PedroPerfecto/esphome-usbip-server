@@ -41,6 +41,8 @@ const char *ep0_probe_str(Ep0Probe r) {
   }
 }
 
+bool ep0_probe_wanted(uint8_t ep, bool reboot_follows) { return ep != 0 && reboot_follows; }
+
 uint16_t out_stuck_pack(const OutStuckInfo &info) {
   const uint16_t pf = info.prefetch_in_flight > 15 ? 15 : info.prefetch_in_flight;
   return static_cast<uint16_t>(pf | (static_cast<uint16_t>(info.reason) << 4) |
