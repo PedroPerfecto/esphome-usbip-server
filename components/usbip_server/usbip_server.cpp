@@ -1,5 +1,6 @@
 #include "usbip_server.h"
 #include "usbip_control.h"
+#include "usbip_session.h"
 #include "usbip_urb.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/application.h"
@@ -776,8 +777,23 @@ int USBIPServer::handle_side_connection_(int listen_sock, char *busid_out) {
     return -1;
   }
   uint8_t raw_busid[usbip::kBusIdSize];
+  char busid[usbip::kBusIdSize];
   if (op.version == usbip::kVersion && op.code == usbip::kOpReqImport && recv_exact(s, raw_busid, sizeof(raw_busid)) &&
-      usbip::decode_req_import_busid(raw_busid, busid_out)) {
+      usbip::decode_req_import_busid(raw_busid, busid)) {
+    // Only an import that would succeed may end the running session. Anything else is answered
+    // here and the session (and import_count_, client_addr_) stays untouched.
+    const bool ready = this->device_ready_();
+    if (!usbip::takeover_allowed(ready, busid, this->busid_.c_str())) {
+      uint8_t out[usbip::kRepImportErrorSize];
+      const size_t len = usbip::encode_rep_import(nullptr, out, sizeof(out));  // status != 0, header only
+      if (len > 0) send_all_(s, out, len);
+      ESP_LOGW(TAG, "Client %s: OP_REQ_IMPORT '%s' during active session refused (%s), session continues", ip, busid,
+               ready ? "busid mismatch" : "no device");
+      shutdown(s, SHUT_RDWR);
+      close(s);
+      return -1;
+    }
+    memcpy(busid_out, busid, usbip::kBusIdSize);
     ESP_LOGW(TAG, "Client %s: OP_REQ_IMPORT '%s' takes over the active session", ip, busid_out);
     tv.tv_sec = 0;  // back to reading without a timeout (the session uses select)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

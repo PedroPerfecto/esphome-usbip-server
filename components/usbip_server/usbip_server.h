@@ -129,8 +129,10 @@ class USBIPServer : public usb_host::USBClient {
   // Serves a session; returns the socket of the next client that took it over
   // (new OP_REQ_IMPORT), or -1. takeover_busid: import already read.
   int serve_client_(int sock, int listen_sock, const char *takeover_busid);
-  // New connection during a session: OP_REQ_DEVLIST is served and closed (-1),
-  // OP_REQ_IMPORT returns the socket and busid (takeover), otherwise closes (-1).
+  // New connection during a session: OP_REQ_DEVLIST is served and closed (-1). OP_REQ_IMPORT that
+  // would succeed (exported busid, device present) returns the socket and busid (takeover); any
+  // other import is refused with OP_REP_IMPORT status != 0 and closed (-1), as is everything else.
+  // -1 = the running session continues.
   int handle_side_connection_(int listen_sock, char *busid_out);
   static void configure_session_socket_(int sock);
   bool handle_submit_(int sock, const usbip::Message &m);
