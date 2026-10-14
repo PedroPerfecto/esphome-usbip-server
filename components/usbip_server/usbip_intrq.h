@@ -11,6 +11,12 @@
 // then only removes a request from IntrWaitFifo and never touches the USB pipe.
 namespace usbip {
 
+// Prefetch storage is always sized for the maximum; only the configured slots are used.
+static constexpr uint8_t kMaxPrefetchTransfers = 2;
+uint8_t clamp_prefetch_transfers(uint8_t transfers);
+// Each transfer whose completion has not been drained reserves one ring entry.
+bool prefetch_ring_full(uint16_t size, uint16_t depth, uint16_t reserved);
+
 // Storage allocator for IntrRing (the server passes one that uses PSRAM; the default uses new/delete).
 struct IntrAllocator {
   void *(*alloc)(size_t size){nullptr};

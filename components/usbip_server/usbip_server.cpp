@@ -160,6 +160,7 @@ void USBIPServer::setup() {
   if (this->max_pending_ > MAX_PENDING_LIMIT) this->max_pending_ = MAX_PENDING_LIMIT;
   this->interrupt_queue_depth_ = std::min<uint16_t>(
       std::max<uint16_t>(this->interrupt_queue_depth_, usbip::IntrRing::kMinDepth), usbip::IntrRing::kMaxDepth);
+  this->prefetch_transfers_ = usbip::clamp_prefetch_transfers(this->prefetch_transfers_);
   this->dev_lock_ = xSemaphoreCreateMutex();
   // Room for every slot and every prefetch transfer: each posts at most one entry per submission.
   this->done_queue_ = xQueueCreate(this->max_pending_ + PREFETCH_COUNT, sizeof(uint8_t));
@@ -176,6 +177,7 @@ void USBIPServer::setup() {
     this->slots_[i].index = i;
   }
   for (uint8_t i = 0; i < PREFETCH_COUNT; ++i) {
+    if (i % PREFETCH_PER_EP >= this->prefetch_transfers_) continue;
     this->prefetch_[i].owner = this;
     this->prefetch_[i].index = static_cast<uint8_t>(MAX_PENDING_LIMIT + i);
   }
@@ -642,9 +644,10 @@ void USBIPServer::dump_config() {
                 "  DMA chunk size: %u\n"
                 "  Max pending: %u\n"
                 "  Interrupt queue depth: %u\n"
+                "  Prefetch transfers: %u\n"
                 "  Out-stuck timeout: %u ms",
                 this->port_, this->busid_.c_str(), (unsigned) this->max_transfer_size_,
-                (unsigned) this->dma_chunk_size_, this->max_pending_, this->interrupt_queue_depth_,
+                (unsigned) this->dma_chunk_size_, this->max_pending_, this->interrupt_queue_depth_, this->prefetch_transfers_,
                 (unsigned) this->out_stuck_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  TCP listening: %s", this->tcp_listening_.load() ? "YES" : "NO");
   usbip::DeviceInfo d;
@@ -1863,7 +1866,7 @@ void USBIPServer::end_session_() {
 //
 // ESP-IDF 5.5 can wait forever in usb_host_endpoint_halt on a periodic pipe (_pipe_cmd_halt waits for
 // a HALT_REQ channel interrupt the DWC controller does not raise for periodic channels; esp-usb PR
-// #577). Interrupt IN endpoints therefore keep up to PREFETCH_PER_EP server-owned transfers of one
+// #577). Interrupt IN endpoints therefore keep up to prefetch_transfers_ server-owned transfers of one
 // MPS each, store the packets in an IntrRing and answer the client's CMD_SUBMIT from it. CMD_UNLINK
 // only removes a waiting request (usbip_intrq.h). All of this runs in the TCP task.
 
@@ -1886,7 +1889,8 @@ USBIPServer::IntrInEp *USBIPServer::find_intr_in_(uint8_t addr) {
 
 uint16_t USBIPServer::pf_in_flight_(const IntrInEp &ep) const {
   uint16_t n = 0;
-  for (const PrefetchXfer *pf : ep.pf) {
+  for (uint8_t k = 0; k < this->prefetch_transfers_; ++k) {
+    const PrefetchXfer *pf = ep.pf[k];
     if (pf != nullptr && pf->in_flight) ++n;
   }
   return n;
@@ -1910,7 +1914,9 @@ bool USBIPServer::setup_intr_eps_() {
   // (NO_DEVICE). Normally done by drain_completions_ before this call; otherwise retry later.
   // check_intr_setup_stuck_ (main loop) reboots if this lasts longer than INTR_SETUP_STUCK_MS.
   uint32_t still = 0;
-  for (const PrefetchXfer &pf : this->prefetch_) {
+  for (uint8_t i = 0; i < PREFETCH_COUNT; ++i) {
+    if (i % PREFETCH_PER_EP >= this->prefetch_transfers_) continue;
+    const PrefetchXfer &pf = this->prefetch_[i];
     if (pf.in_flight) ++still;
   }
   if (still != 0) {
@@ -1925,7 +1931,9 @@ bool USBIPServer::setup_intr_eps_() {
     return false;
   }
   this->intr_setup_postponed_ms_.store(0, std::memory_order_release);
-  for (PrefetchXfer &pf : this->prefetch_) {
+  for (uint8_t i = 0; i < PREFETCH_COUNT; ++i) {
+    if (i % PREFETCH_PER_EP >= this->prefetch_transfers_) continue;
+    PrefetchXfer &pf = this->prefetch_[i];
     if (pf.xfer != nullptr) usb_host_transfer_free(pf.xfer);
     pf.xfer = nullptr;
     pf.ep = nullptr;
@@ -1954,7 +1962,7 @@ bool USBIPServer::setup_intr_eps_() {
     }
     ep.q.reset();
     bool alloc_ok = true;
-    for (uint8_t k = 0; k < PREFETCH_PER_EP; ++k) {
+    for (uint8_t k = 0; k < this->prefetch_transfers_; ++k) {
       PrefetchXfer &pf = this->prefetch_[used * PREFETCH_PER_EP + k];
       usb_transfer_t *x = nullptr;
       if (usb_host_transfer_alloc(e.mps, 0, &x) != ESP_OK || x == nullptr) {
@@ -1972,7 +1980,8 @@ bool USBIPServer::setup_intr_eps_() {
       ep.pf[k] = &pf;
     }
     if (!alloc_ok) {
-      for (PrefetchXfer *&p : ep.pf) {
+      for (uint8_t k = 0; k < this->prefetch_transfers_; ++k) {
+        PrefetchXfer *&p = ep.pf[k];
         if (p != nullptr && p->xfer != nullptr) usb_host_transfer_free(p->xfer);
         if (p != nullptr) {
           p->xfer = nullptr;
@@ -1988,7 +1997,7 @@ bool USBIPServer::setup_intr_eps_() {
     ep.active = true;
     ++used;
     ESP_LOGI(TAG, "Interrupt IN ep %02X: prefetch without HALT (%u transfers, queue %u x %u B)", e.address,
-             PREFETCH_PER_EP, ep.q.ring().depth(), e.mps);
+             this->prefetch_transfers_, ep.q.ring().depth(), e.mps);
   }
   if (used > 0) {
     ESP_LOGI(TAG, "Free heap after interrupt setup: internal %u B (largest block %u B), PSRAM %u B",
@@ -2106,7 +2115,8 @@ void USBIPServer::pump_prefetch_(IntrInEp &ep, uint32_t now) {
       return;
     }
   }
-  for (PrefetchXfer *pf : ep.pf) {
+  for (uint8_t k = 0; k < this->prefetch_transfers_; ++k) {
+    PrefetchXfer *pf = ep.pf[k];
     if (pf == nullptr || pf->xfer == nullptr || pf->in_flight) continue;
     // Every transfer in flight may still bring a packet: count them as taken ring entries.
     if (!ep.q.should_prefetch(true, now, usbip::kDefaultPrefetchWindowMs, this->pf_in_flight_(ep))) break;
@@ -2125,14 +2135,14 @@ void USBIPServer::pump_prefetch_(IntrInEp &ep, uint32_t now) {
     this->in_submitted_.fetch_add(1, std::memory_order_relaxed);
   }
   // intr_q_full: counted once each time the ring starts holding the prefetch back.
-  const bool full = static_cast<uint32_t>(ep.q.ring().size()) + this->pf_in_flight_(ep) >= ep.q.ring().depth();
+  const bool full = usbip::prefetch_ring_full(ep.q.ring().size(), ep.q.ring().depth(), this->pf_in_flight_(ep));
   const bool blocked = full && ep.q.request_active(now, usbip::kDefaultPrefetchWindowMs);
   if (blocked && !ep.blocked_full) this->intr_q_full_.fetch_add(1, std::memory_order_relaxed);
   ep.blocked_full = blocked;
 }
 
 bool USBIPServer::handle_prefetch_done_(int sock, uint8_t pf_index) {
-  if (pf_index >= PREFETCH_COUNT) {
+  if (pf_index >= PREFETCH_COUNT || pf_index % PREFETCH_PER_EP >= this->prefetch_transfers_) {
     this->stale_skip_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }

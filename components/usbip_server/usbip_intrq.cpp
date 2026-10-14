@@ -6,6 +6,14 @@
 
 namespace usbip {
 
+uint8_t clamp_prefetch_transfers(uint8_t transfers) {
+  return std::min<uint8_t>(std::max<uint8_t>(transfers, 1), kMaxPrefetchTransfers);
+}
+
+bool prefetch_ring_full(uint16_t size, uint16_t depth, uint16_t reserved) {
+  return static_cast<uint32_t>(size) + reserved >= depth;
+}
+
 // ---------------------------------------------------------------- IntrRing
 
 void *IntrRing::alloc_(size_t size) {
@@ -230,7 +238,7 @@ void IntrInQueue::expire_window(uint32_t now_ms, uint32_t window_ms) {
 
 bool IntrInQueue::should_prefetch(bool session_active, uint32_t now_ms, uint32_t window_ms,
                                   uint16_t reserved) const {
-  const bool full = static_cast<uint32_t>(this->ring_.size()) + reserved >= this->ring_.depth();
+  const bool full = prefetch_ring_full(this->ring_.size(), this->ring_.depth(), reserved);
   return prefetch_allowed(session_active, full, !this->waiting_.empty(), this->have_last_request_,
                           this->last_request_ms_, now_ms, window_ms);
 }

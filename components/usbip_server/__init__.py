@@ -13,6 +13,7 @@ CONF_MAX_PENDING = "max_pending"
 CONF_DMA_CHUNK_SIZE = "dma_chunk_size"
 CONF_INTERFACES = "interfaces"
 CONF_INTERRUPT_QUEUE_DEPTH = "interrupt_queue_depth"
+CONF_PREFETCH_TRANSFERS = "prefetch_transfers"
 CONF_OUT_STUCK_TIMEOUT = "out_stuck_timeout"
 CONF_USBIP_SERVER_ID = "usbip_server_id"
 
@@ -43,6 +44,7 @@ CONFIG_SCHEMA = cv.COMPONENT_SCHEMA.extend(
         # packets stored per interrupt IN endpoint (prefetch without HALT); one entry = one packet <= MPS,
         # storage in PSRAM (depth * MPS bytes)
         cv.Optional(CONF_INTERRUPT_QUEUE_DEPTH, default=32): cv.int_range(min=4, max=4096),
+        cv.Optional(CONF_PREFETCH_TRANSFERS, default=2): cv.int_range(min=1, max=2),
         # stuck detector: an interrupt OUT in flight this long without a completion, or an orphaned
         # transfer still in flight this long after it was asked to end, makes the server record
         # OUT_STUCK and reboot (at most 3 times per hour of run time)
@@ -66,6 +68,7 @@ async def to_code(config):
     cg.add(var.set_max_pending(config[CONF_MAX_PENDING]))
     cg.add(var.set_dma_chunk_size(config[CONF_DMA_CHUNK_SIZE]))
     cg.add(var.set_interrupt_queue_depth(config[CONF_INTERRUPT_QUEUE_DEPTH]))
+    cg.add(var.set_prefetch_transfers(config[CONF_PREFETCH_TRANSFERS]))
     cg.add(var.set_out_stuck_timeout(config[CONF_OUT_STUCK_TIMEOUT].total_milliseconds))
     if CONF_INTERFACES in config:
         mask = 0

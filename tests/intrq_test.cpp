@@ -574,3 +574,44 @@ TEST_CASE("prefetch window: without expiry the raw comparison holds up to a full
   CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1000 + 0x80000000u));
   CHECK_FALSE(prefetch_allowed(true, false, false, true, 1000, 1000 + 0xF0000000u));
 }
+
+TEST_CASE("prefetch transfers: count is clamped to 1..2") {
+  CHECK(clamp_prefetch_transfers(0) == 1);
+  CHECK(clamp_prefetch_transfers(1) == 1);
+  CHECK(clamp_prefetch_transfers(2) == 2);
+  CHECK(clamp_prefetch_transfers(3) == 2);
+  CHECK(clamp_prefetch_transfers(255) == 2);
+}
+
+TEST_CASE("prefetch transfers: configured slots reserve room for every completion") {
+  for (uint8_t transfers : {uint8_t{1}, uint8_t{2}}) {
+    CAPTURE(transfers);
+    IntrInQueue q;
+    REQUIRE(q.init(4, 64));
+    REQUIRE(q.add_request(1, 1024, 100));
+    REQUIRE(push(q, 64, 1));
+    REQUIRE(push(q, 64, 2));
+    uint16_t in_flight = 0;
+    for (uint8_t k = 0; k < clamp_prefetch_transfers(transfers); ++k) {
+      REQUIRE(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, in_flight));
+      ++in_flight;
+    }
+    CHECK(in_flight == transfers);
+    CHECK(prefetch_ring_full(q.ring().size(), q.ring().depth(), in_flight) == (transfers == 2));
+    CHECK(q.should_prefetch(true, 100, kDefaultPrefetchWindowMs, in_flight) == (transfers == 1));
+    // Draining a completion replaces its reserved entry with a stored packet.
+    while (in_flight != 0) {
+      --in_flight;
+      REQUIRE(push(q, 64, 3));
+      CHECK(prefetch_ring_full(q.ring().size(), q.ring().depth(), in_flight) == (transfers == 2));
+    }
+  }
+}
+
+TEST_CASE("prefetch reservations: boundary and large sums do not wrap") {
+  CHECK_FALSE(prefetch_ring_full(2, 4, 1));
+  CHECK(prefetch_ring_full(2, 4, 2));
+  CHECK(prefetch_ring_full(3, 4, 2));
+  CHECK(prefetch_ring_full(4, 4, 0));
+  CHECK(prefetch_ring_full(65535, 65535, 1));
+}

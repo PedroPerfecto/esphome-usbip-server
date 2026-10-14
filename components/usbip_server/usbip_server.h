@@ -32,7 +32,7 @@ namespace esphome::usbip_server {
 static constexpr uint8_t MAX_PENDING_LIMIT = 32;
 // Interrupt IN endpoints served from server-owned prefetch transfers (no HALT, see usbip_intrq.h).
 static constexpr uint8_t MAX_INTR_IN_EPS = 4;
-static constexpr uint8_t PREFETCH_PER_EP = 2;
+static constexpr uint8_t PREFETCH_PER_EP = usbip::kMaxPrefetchTransfers;
 static constexpr uint8_t PREFETCH_COUNT = MAX_INTR_IN_EPS * PREFETCH_PER_EP;
 
 // USB/IP server on top of ESPHome usb_host.
@@ -102,6 +102,7 @@ class USBIPServer : public usb_host::USBClient {
   void set_max_pending(uint8_t count) { this->max_pending_ = count; }
   void set_dma_chunk_size(uint32_t size) { this->dma_chunk_size_ = size; }
   void set_interface_mask(uint32_t mask) { this->interface_mask_ = mask; }
+  void set_prefetch_transfers(uint8_t transfers) { this->prefetch_transfers_ = usbip::clamp_prefetch_transfers(transfers); }
   void set_interrupt_queue_depth(uint16_t depth) { this->interrupt_queue_depth_ = depth; }
   void set_out_stuck_timeout(uint32_t ms) { this->out_stuck_timeout_ms_ = ms; }
 
@@ -247,6 +248,7 @@ class USBIPServer : public usb_host::USBClient {
   uint8_t max_pending_{16};
   uint32_t dma_chunk_size_{16384};
   uint32_t interface_mask_{usbip::kAllInterfaces};
+  uint8_t prefetch_transfers_{usbip::kMaxPrefetchTransfers};
   uint16_t interrupt_queue_depth_{usbip::IntrRing::kDefaultDepth};
 
   IntrInEp intr_in_[MAX_INTR_IN_EPS];
